@@ -3,210 +3,194 @@
 ## 1. Executive Summary
 
 - **Analysis Status:** Complete
-- **Key Outcome:** Seven critical-to-high authentication vulnerabilities were identified spanning every major authentication domain: SQL injection login bypass, session fixation, missing cookie security flags, transport exposure (HTTP only), no rate limiting, broken password storage (MD5, unsalted), hardcoded default credentials, and three endpoints fully unauthenticated. The application has zero effective authentication defense in depth.
+- **Key Outcome:** Eight distinct authentication and session management vulnerabilities were identified. The application is critically compromised across every authentication domain: it uses a broken password hashing algorithm (MD5, unsalted), has no rate limiting on any authentication endpoint, exposes admin credentials in a publicly-downloadable file, allows SQL injection authentication bypass, is vulnerable to session fixation (session ID never regenerated after login), sets no `HttpOnly`, `Secure`, or `SameSite` flags on the session cookie, and has three endpoints that require no authentication at all. The application is served over plain HTTP with no TLS.
 - **Purpose of this Document:** This report provides the strategic context on the application's authentication mechanisms, dominant flaw patterns, and key architectural details necessary to effectively exploit the vulnerabilities listed in the exploitation queue.
 
 ---
 
 ## 2. Dominant Vulnerability Patterns
 
-### Pattern 1: Complete Absence of Authentication Controls on Critical Endpoints
+### Pattern 1: Complete Absence of Transport Security
+- **Description:** The application is served exclusively over HTTP (port 9010) with zero TLS/HTTPS. No `Strict-Transport-Security` header is ever sent. Session cookies and credentials are transmitted in plaintext over the network. Confirmed live: `curl -si http://host.docker.internal:9010/index.php` — no HSTS header, no TLS redirect.
+- **Implication:** Any network-adjacent attacker (on the same network segment or an upstream provider) can passively intercept session cookies and credentials in transit, enabling trivial session hijacking and credential theft.
+- **Representative Findings:** `AUTH-VULN-01`.
 
-- **Description:** Three PHP files (`delete_members.php`, `print_membership_card.php`, `get_membership_amount.php`) have no session guard whatsoever. The authentication check pattern `if (!isset($_SESSION['user_id'])) { header("Location: index.php"); exit(); }` is simply absent. Any unauthenticated HTTP request is fully processed, including SQL execution and data return.
-- **Implication:** Any internet-facing attacker can delete member records, access full PII membership cards, and query pricing data without any credential. The `delete_members.php` absence is particularly egregious — it was commented out in a prior version of the code (lines 1–26 are commented-out logic) and the replacement implementation at lines 30–59 omits the session guard entirely.
-- **Representative Findings:** `AUTH-VULN-06`, `AUTH-VULN-07`.
+### Pattern 2: Broken Authentication Credentials (MD5 + Default Credentials)
+- **Description:** All passwords are stored as bare MD5 hashes (no salt, no work factor). The default admin password (`codeastro.com`) is committed to version control, present in seven copies including one in the web-accessible `uploads/` directory. The MD5 hash (`f2d0ff370380124029c2b807a924156c`) is also present in a publicly downloadable database dump at `/DATABASE FILE/membershiphp.sql`. Both the plaintext credential and the MD5 hash are trivially obtainable by any unauthenticated visitor.
+- **Implication:** An attacker can log in immediately without brute force by downloading `uploads/01 LOGIN DETAILS & PROJECT INFO.txt` — no guessing required. Even if credentials were changed, MD5 is reversible with rainbow tables (e.g., crackstation.net).
+- **Representative Findings:** `AUTH-VULN-04`, `AUTH-VULN-05`.
 
-### Pattern 2: SQL Injection Enabling Full Authentication Bypass
+### Pattern 3: Session Management Failures
+- **Description:** Three independent session management failures compound each other: (a) No session ID rotation after login (`session_regenerate_id()` never called), enabling session fixation — confirmed live; (b) `PHPSESSID` cookie lacks `HttpOnly`, `Secure`, and `SameSite` flags — confirmed live: `Set-Cookie: PHPSESSID=...; path=/` only; (c) No session timeout configured beyond PHP defaults (1440s).
+- **Implication:** Attackers can pre-plant a known session ID, wait for the admin to log in, and then use that same ID to access the application. The missing `HttpOnly` flag allows JavaScript to read the session cookie (enabling XSS-to-session-hijack chains). The missing `Secure` flag allows cookie transmission over HTTP.
+- **Representative Findings:** `AUTH-VULN-02`, `AUTH-VULN-03`.
 
-- **Description:** The login handler at `index.php` line 14 constructs a raw SQL query by directly interpolating `$_POST['email']` without sanitization, prepared statements, or parameterization. The `password` field is MD5-hashed before use, making it injection-resistant; however, the `email` field provides a complete bypass vector. Live testing confirmed that `' OR '1'='1' -- -` in the email field returns HTTP 302 redirect to dashboard, confirming full bypass.
-- **Implication:** An attacker with no credentials can achieve full administrative access to the application via a single HTTP request. No account exists to target — the injection bypasses the WHERE clause entirely.
-- **Representative Finding:** `AUTH-VULN-01`.
+### Pattern 4: SQL Injection Authentication Bypass
+- **Description:** The login handler at `index.php:14` concatenates raw POST parameters directly into a SQL query: `SELECT * FROM users WHERE email = '$email' AND password = '$hashed_password'`. The `email` field is completely unsanitized. A payload of `' OR '1'='1' -- -` bypasses authentication entirely. Confirmed live: sending this payload returns HTTP 302 redirect to `dashboard.php`.
+- **Implication:** An attacker can log in as the admin without knowing any credentials by exploiting the SQL injection.
+- **Representative Findings:** `AUTH-VULN-06`.
 
-### Pattern 3: Broken Session Management
+### Pattern 5: No Rate Limiting on Any Authentication Endpoint
+- **Description:** Ten rapid successive failed login attempts to `POST /index.php` all returned HTTP 200 with no lockout, no CAPTCHA, no throttle, no 429 response. Confirmed live. No WAF, no reverse proxy, and no application-level rate limiting exist anywhere.
+- **Implication:** Attackers can brute-force passwords or perform credential stuffing at unlimited speed.
+- **Representative Findings:** `AUTH-VULN-07`.
 
-- **Description:** Three compounding session management failures exist simultaneously: (1) `session_regenerate_id()` is never called after successful login, enabling session fixation; (2) `PHPSESSID` cookie is set with no `HttpOnly`, `Secure`, or `SameSite` flags; (3) `logout.php` destroys the server-side session but never issues `setcookie(session_name(), '', time()-3600)` to clear the client-side cookie. Live testing confirmed session fixation: pre-login session ID `e6f021b2c4aae04641e5a380fc709540` remained valid post-login (no `Set-Cookie` header on the 302 response), and the same ID accessed `dashboard.php` successfully.
-- **Implication:** An attacker who pre-sets a victim's PHPSESSID (via network injection on HTTP, XSS, or other means) gains persistent authenticated access that survives the victim's login. Additionally, the cookie is sniffable on the wire (HTTP-only, no Secure flag) and accessible to JavaScript (no HttpOnly flag).
-- **Representative Findings:** `AUTH-VULN-03`, `AUTH-VULN-04`, `AUTH-VULN-05`.
-
-### Pattern 4: Broken Credential Storage and Policy
-
-- **Description:** Passwords are hashed using `md5($password)` with no salt (`index.php` line 12, `settings.php` line 59). MD5 is a general-purpose hash function, not a password hash, and is reversible via rainbow tables. The database is seeded with the default credential `admin@test.com` / `admin123` (confirmed in `init.sql` line 50). No server-side password policy exists — any length password, including single characters, is accepted. Live confirmation: `admin123` successfully authenticates.
-- **Implication:** Any attacker who extracts the `users` table (via SQL injection) can immediately reverse all password hashes. The known default credential eliminates the need for cracking entirely.
-- **Representative Findings:** `AUTH-VULN-02`, `AUTH-VULN-08`.
+### Pattern 6: Missing Authentication on Critical Endpoints
+- **Description:** Three endpoints — `print_membership_card.php`, `delete_members.php`, and `get_membership_amount.php` — have no `isset($_SESSION['user_id'])` check whatsoever. All three are accessible by any unauthenticated HTTP request. Confirmed live: `GET /print_membership_card.php?id=1` returns HTTP 200 with full member PII; `GET /delete_members.php?id=X` returns HTTP 302 (executes delete logic) without authentication.
+- **Implication:** Any unauthenticated attacker can enumerate and delete all member records, and read all member PII without any credentials.
+- **Representative Findings:** `AUTH-VULN-08`.
 
 ---
 
 ## 3. Strategic Intelligence for Exploitation
 
-- **Authentication Method:** Single PHP native session cookie (`PHPSESSID`). No JWT, no token-based auth, no MFA. One user account exists in the `users` table (no registration capability).
-- **Session Token Details:** `PHPSESSID` cookie, PHP default session (no configured lifetime). Observed format: 32-character hex string (PHP's default `session.hash_function` = SHA-1 or MD5 of random bytes, 128 bits effective entropy — token entropy itself is not a weakness, but the lack of flags and rotation is catastrophic).
-- **Transport:** HTTP only (port 9010/80). No TLS, no HSTS. All credentials and session tokens travel in plaintext.
-- **Password Storage:** MD5 (unsalted). MD5 hash of `admin123` = `0192023a7bbd73250516f069df18b500`. Fully reversible with any rainbow table or online cracker.
-- **Default Credentials:** `admin@test.com` / `admin123` — seeded in `init.sql` line 50, committed to version control. Live confirmed: HTTP 302 to dashboard on POST.
-- **Unauthenticated Endpoints:** `GET /delete_members.php?id=N`, `GET /print_membership_card.php?id=N`, `GET /get_membership_amount.php?membershipTypeId=N` — no session check in source code.
-- **Login Bypass SQLi:** `POST /index.php` with `email=' OR '1'='1' -- -&password=anything&login=1` → HTTP 302 to dashboard. Live confirmed.
-- **Session Fixation:** Pre-login session ID is reused post-login. No `session_regenerate_id()` call anywhere. Live confirmed.
-- **Password Reset:** Does not exist. No forgot-password, no reset token, no email flow.
-- **SSO/OAuth:** Does not exist. No external identity provider.
-- **Rate Limiting:** Absent. 10 sequential failed login attempts all returned HTTP 200. No lockout, no CAPTCHA, no backoff.
-- **Error Messages:** Generic — both valid and invalid email return "Invalid email or password!" (no user enumeration via error message).
-- **Password Change Flaw:** `settings.php` lines 44–72 — `$confirmPassword` is read (line 48) but never compared against `$newPassword`. The new password is set to `md5($newPassword)` regardless of whether confirmation matches. This is a logic flaw but requires authenticated access to exploit.
-- **Cookie Flags Observed:** `Set-Cookie: PHPSESSID=...; path=/` — no `HttpOnly`, no `Secure`, no `SameSite`.
-- **Cache Headers on Auth Responses:** `Cache-Control: no-store, no-cache, must-revalidate; Pragma: no-cache` — SAFE. Auth responses are not cached.
+- **Authentication Method:** Username/password form POST to `/index.php`. PHP file-based session (`PHPSESSID` cookie). No JWT, no OAuth, no MFA, no password reset flow.
+- **Session Token Details:** Session is managed via PHP's default `session_start()`. Cookie: `PHPSESSID=<value>; path=/` — no `HttpOnly`, no `Secure`, no `SameSite`. Sessions stored in `/tmp/sess_*` on the server. Default TTL ~1440 seconds (PHP `session.gc_maxlifetime`). `session_regenerate_id()` is never called — session fixation is exploitable.
+- **Password Policy:** No server-side password policy enforced. Passwords hashed with bare `md5()` at `index.php:12`. No minimum length, no complexity requirements, no breach-list check. Change password via `POST /settings.php` with `changePassword` action; `confirmPassword` field is read but never compared to `newPassword` (dead code at `settings.php:48`).
+- **Default Credentials:** `admin@mail.com` / `codeastro.com` — publicly available at `http://host.docker.internal:9010/uploads/01%20LOGIN%20DETAILS%20%26%20PROJECT%20INFO.txt`. MD5 hash also in `/DATABASE FILE/membershiphp.sql`.
+- **No OAuth/SSO:** No OAuth, OIDC, SAML, or SSO flows exist.
+- **No Password Reset:** No forgot-password endpoint, no token generation, no email sending.
+- **No Registration:** No public user registration. Accounts require direct DB insertion.
+- **Logout:** `GET /logout.php` — properly destroys server-side session (`$_SESSION = array(); session_destroy()`). No CSRF protection on logout (CSRF-forced logout possible, but out of scope for AuthN analysis).
+- **Cache-Control:** `Cache-Control: no-store, no-cache, must-revalidate` and `Pragma: no-cache` are present on all pages (PHP default session headers). This is a positive control.
 
 ---
 
-## 4. Endpoint-by-Endpoint Authentication Verdict
+## 4. Methodology Checklist: Verdict Summary
 
-| Endpoint | Auth Guard | Finding |
-|---|---|---|
-| `POST /index.php` | None (public) | SQLi login bypass; no rate limit; MD5 weak hashing |
-| `GET /logout.php` | None (public) | Server-side session destroyed but client cookie NOT cleared; no CSRF protection on logout |
-| `GET /dashboard.php` | `isset($_SESSION['user_id'])` | Guard correct; no issues beyond session quality |
-| `GET /manage_members.php` | Guard AFTER DB query (line 8 vs line 4) | Auth-after-query: DB executes before guard; minor |
-| `GET /delete_members.php` | **NO GUARD** | Unauthenticated destructive DELETE |
-| `GET /print_membership_card.php` | **NO GUARD** | Unauthenticated PII disclosure |
-| `GET /get_membership_amount.php` | **NO GUARD** | Unauthenticated data access |
-| `GET /list_renewal.php` | Guard AFTER DB query (line 7 vs line 4) | Auth-after-query: minor |
-| `GET /view_type.php` | Guard AFTER DB query (line 7 vs line 4) | Auth-after-query: minor |
-| `POST /settings.php (changePassword)` | `isset($_SESSION['user_id'])` | `confirmPassword` never compared to `newPassword`; MD5 for new hash |
-| All other authenticated endpoints | `isset($_SESSION['user_id'])` | Guard present and correct; no bypass |
+| Check | Endpoint/Component | Verdict | Finding ID |
+|---|---|---|---|
+| Transport/HTTPS enforcement | All endpoints (HTTP only) | **VULNERABLE** | AUTH-VULN-01 |
+| HSTS header | All responses | **VULNERABLE** | AUTH-VULN-01 |
+| Cache-Control: no-store | All auth responses | **SAFE** | — |
+| Rate limiting on login | `POST /index.php` | **VULNERABLE** | AUTH-VULN-07 |
+| Rate limiting on password change | `POST /settings.php` (changePassword) | **VULNERABLE** | AUTH-VULN-07 |
+| CAPTCHA / lockout | `POST /index.php` | **VULNERABLE** | AUTH-VULN-07 |
+| Session cookie HttpOnly | `PHPSESSID` | **VULNERABLE** | AUTH-VULN-02 |
+| Session cookie Secure | `PHPSESSID` | **VULNERABLE** | AUTH-VULN-02 |
+| Session cookie SameSite | `PHPSESSID` | **VULNERABLE** | AUTH-VULN-02 |
+| Session ID rotation after login | `POST /index.php` → session | **VULNERABLE** | AUTH-VULN-03 |
+| Logout server-side invalidation | `GET /logout.php` | **SAFE** | — |
+| Session IDs in URLs | All endpoints | **SAFE** | — |
+| Token/session entropy | `PHPSESSID` (PHP default) | **SAFE** (PHP uses CSPRNG) | — |
+| Token expiration | Session TTL | Medium risk (default 1440s only) | — |
+| Session fixation | Login flow | **VULNERABLE** | AUTH-VULN-03 |
+| Default credentials in code/files | `uploads/` credential file | **VULNERABLE** | AUTH-VULN-04 |
+| Password hashing algorithm | `index.php:12`, `settings.php:58` | **VULNERABLE** (MD5) | AUTH-VULN-05 |
+| Strong password policy | `POST /settings.php` (changePassword) | **VULNERABLE** (none enforced) | AUTH-VULN-05 |
+| Error message enumeration | Login response | **SAFE** (generic "Invalid email or password") | — |
+| Auth state in URLs | All redirects | **SAFE** | — |
+| Recovery token single-use / TTL | N/A (no password reset flow) | N/A | — |
+| Logout cookie clearing | `GET /logout.php` | **SAFE** | — |
+| SQL injection auth bypass | `POST /index.php` | **VULNERABLE** | AUTH-VULN-06 |
+| OAuth state/nonce | N/A (no OAuth) | N/A | — |
+| Missing auth check on endpoints | `print_membership_card.php`, `delete_members.php`, `get_membership_amount.php` | **VULNERABLE** | AUTH-VULN-08 |
 
 ---
 
 ## 5. Secure by Design: Validated Components
 
-These components were analyzed and found to have defenses or characteristics that do not constitute authentication vulnerabilities.
+These components were analyzed and found to have adequate defenses. They are low-priority for further testing.
 
 | Component/Flow | Endpoint/File Location | Defense Mechanism Implemented | Verdict |
 |---|---|---|---|
-| Login error messages | `index.php` line 26 | Generic "Invalid email or password!" returned for both valid-email/wrong-password AND invalid-email cases | SAFE (no enumeration) |
-| Auth response caching | All endpoints via Apache | `Cache-Control: no-store, no-cache, must-revalidate` + `Pragma: no-cache` present on all responses | SAFE |
-| Server-side session destruction on logout | `logout.php` lines 4–6 | `$_SESSION = array()` then `session_destroy()` — server-side session data is cleared | SAFE (server side only; client cookie not cleared is noted separately) |
-| Session token entropy | `includes/config.php` line 2 | PHP default `session_start()` generates cryptographically random 128-bit session IDs | SAFE |
-| SSO / OAuth | N/A | No OAuth, OIDC, or SSO integration exists | N/A |
-| Password reset tokens | N/A | No password reset feature exists | N/A |
+| Cache-Control headers | All pages (PHP session defaults) | `Cache-Control: no-store, no-cache, must-revalidate` + `Pragma: no-cache` set automatically by PHP session | SAFE |
+| Session entropy | `PHPSESSID` generation | PHP uses `/dev/urandom` (CSPRNG) for session ID generation by default in PHP 7.4 | SAFE |
+| Logout server-side invalidation | `logout.php:4-6` | `$_SESSION = array(); session_destroy()` — server-side session data destroyed; old session ID no longer valid | SAFE |
+| Error messages (enumeration) | `index.php:26` | Generic error: "Invalid email or password!" — no differentiation between bad username and bad password | SAFE |
+| Session IDs not in URLs | All pages | No `session.use_only_cookies = 0` configuration; session IDs are not appended to URLs | SAFE |
+| Auth check on protected pages | All 18 protected PHP files | `if (!isset($_SESSION['user_id'])) { header("Location: index.php"); exit(); }` blocks unauthenticated access to the protected set | SAFE (for the protected set only) |
+| `confirmPassword` read on change | `settings.php:48` | Read but never compared to `newPassword` — this is a logic bug (non-enforcement) rather than an auth bypass; the password change still requires valid `currentPassword` | LOW RISK |
 
 ---
 
-## 6. Detailed Vulnerability Findings
+## 6. Exploitation Queue
 
-### AUTH-VULN-01: SQL Injection Login Bypass (Authentication_Bypass)
-
-- **Vulnerability Type:** Authentication_Bypass
-- **Source Endpoint:** `POST /index.php`
-- **Vulnerable Code Location:** `index.php:6,14` — `$email = $_POST['email']` flows directly into `"SELECT * FROM users WHERE email = '$email' AND password = '$hashed_password'"` with no sanitization or prepared statement.
-- **Missing Defense:** No parameterized query / prepared statement. No input sanitization. Raw string interpolation of user-supplied `email` field into SQL.
-- **Exploitation Hypothesis:** An attacker submitting `' OR '1'='1' -- -` as the email (any password) will cause the WHERE clause to evaluate true for all rows, returning the first user record and establishing an authenticated session without valid credentials.
-- **Suggested Exploit Technique:** `sql_injection_auth_bypass`
-- **Confidence:** High — Live confirmed. HTTP 302 to `dashboard.php` received with payload `email=admin%40test.com'+OR+'1'%3D'1'+--+-&password=anything`.
-
----
-
-### AUTH-VULN-02: Default Hardcoded Credentials (Weak_Credentials)
-
-- **Vulnerability Type:** Weak_Credentials
-- **Source Endpoint:** `POST /index.php`
-- **Vulnerable Code Location:** `init.sql:50` — `INSERT INTO users (email, password) VALUES ('admin@test.com', MD5('admin123'))` seeds the only user account with a trivially guessable password. `index.php:12` uses `md5($password)` to verify.
-- **Missing Defense:** No credential rotation requirement post-deployment. No environment-specific credential generation. Default credentials committed to version control and seeded directly into production database.
-- **Exploitation Hypothesis:** An attacker using `admin@test.com` / `admin123` will authenticate successfully and receive full administrative session access on first attempt.
-- **Suggested Exploit Technique:** `default_credential_login`
-- **Confidence:** High — Live confirmed. HTTP 302 to dashboard received with these exact credentials.
-
----
-
-### AUTH-VULN-03: Session Fixation (Login_Flow_Logic)
-
-- **Vulnerability Type:** Login_Flow_Logic
-- **Source Endpoint:** `POST /index.php`
-- **Vulnerable Code Location:** `index.php:17-24` — After `$result->num_rows == 1`, the code sets `$_SESSION['user_id']` and redirects. `session_regenerate_id()` is never called anywhere in the codebase (confirmed by full grep of all PHP files).
-- **Missing Defense:** `session_regenerate_id(true)` is absent from the login success path. The pre-login session ID is silently promoted to authenticated status without issuance of a new ID.
-- **Exploitation Hypothesis:** An attacker who can set a victim's `PHPSESSID` cookie to a known value (via network interception on HTTP, XSS, subdomain cookie injection, or social engineering) before the victim logs in will gain authenticated session access using that known ID after the victim authenticates.
-- **Suggested Exploit Technique:** `session_fixation`
-- **Confidence:** High — Live confirmed. Session ID `e6f021b2c4aae04641e5a380fc709540` set pre-login; no `Set-Cookie` header on login 302 response; same ID accessed `dashboard.php` returning HTTP 200.
-
----
-
-### AUTH-VULN-04: Session Cookie Missing Security Flags (Session_Management_Flaw)
-
-- **Vulnerability Type:** Session_Management_Flaw
-- **Source Endpoint:** All endpoints (session-wide issue)
-- **Vulnerable Code Location:** `includes/config.php:2` — `session_start()` with no `session_set_cookie_params()` configuration. No `ini_set('session.cookie_httponly', 1)`, no `ini_set('session.cookie_secure', 1)`, no `ini_set('session.cookie_samesite', 'Strict')` anywhere in codebase.
-- **Missing Defense:** `HttpOnly` flag (prevents JavaScript access), `Secure` flag (prevents transmission over HTTP), `SameSite=Strict` or `Lax` (prevents cross-site request inclusion of cookie).
-- **Exploitation Hypothesis:** An attacker on the same network (or exploiting any stored/reflected XSS) can steal the `PHPSESSID` cookie value via JavaScript (`document.cookie`) or network sniffing and replay it to hijack the administrative session.
-- **Suggested Exploit Technique:** `session_hijacking`
-- **Confidence:** High — Live observed: `Set-Cookie: PHPSESSID=...; path=/` with no additional flags. HTTP-only transport confirmed.
-
----
-
-### AUTH-VULN-05: Transport Exposure — HTTP Only, No TLS/HSTS (Transport_Exposure)
-
+### AUTH-VULN-01: Transport Exposure — HTTP-only, No HSTS
 - **Vulnerability Type:** Transport_Exposure
-- **Source Endpoint:** All endpoints — `http://host.docker.internal:9010/`
-- **Vulnerable Code Location:** `docker-compose.yml:6` — `ports: "9010:80"` with no 443 mapping; `Dockerfile` — no SSL module or certificate configuration.
-- **Missing Defense:** No TLS termination. No HSTS header (`Strict-Transport-Security` absent from all responses). All credentials, session tokens, and PII travel in cleartext over HTTP.
-- **Exploitation Hypothesis:** An attacker with network access between the client and server (e.g., same LAN, rogue access point, or ISP-level interception) can capture cleartext `PHPSESSID` cookie values and POST credentials from the login form, enabling full session hijacking and credential theft without any cryptographic barrier.
-- **Suggested Exploit Technique:** `credential_interception` / `session_hijacking`
-- **Confidence:** High — Live confirmed: no `Strict-Transport-Security` header in any response; application served exclusively on HTTP port 9010.
+- **Externally Exploitable:** true
+- **Source Endpoint:** ALL endpoints — `GET/POST http://host.docker.internal:9010/*`
+- **Vulnerable Code Location:** No TLS configuration exists. `docker-compose.yml` exposes port 9010 as HTTP only. No `.htaccess` HTTPS redirect. No Apache `VirtualHost` with SSL. Confirmed: server responds on HTTP with no TLS.
+- **Missing Defense:** No TLS/HTTPS; no `Strict-Transport-Security` header; no HTTPS redirect. All traffic including `PHPSESSID` cookies and credentials transmitted in plaintext.
+- **Exploitation Hypothesis:** A network-adjacent attacker performing passive traffic interception (e.g., on the same LAN segment) can capture the admin's `PHPSESSID` session cookie or `email`/`password` credentials in cleartext as they transit the network, then replay the cookie or credentials to gain full admin access.
+- **Suggested Exploit Technique:** credential/session theft via passive network interception (MITM, ARP poisoning, or passive sniff on shared network segment).
+- **Confidence:** High
+- **Notes:** Application is HTTP-only on port 9010. No CDN, no WAF, no TLS termination anywhere. Cookie lacks `Secure` flag, so it is also transmitted over HTTP by browsers without warning.
 
----
-
-### AUTH-VULN-06: Unauthenticated Access to Destructive Endpoint (Authentication_Bypass)
-
-- **Vulnerability Type:** Authentication_Bypass
-- **Source Endpoint:** `GET /delete_members.php`
-- **Vulnerable Code Location:** `delete_members.php:30-59` — `include('includes/config.php')` starts session but no `isset($_SESSION['user_id'])` check exists. The original authenticated version was commented out (lines 1–26) and the replacement lacks the guard entirely.
-- **Missing Defense:** Session guard `if (!isset($_SESSION['user_id'])) { header("Location: index.php"); exit(); }` is completely absent.
-- **Exploitation Hypothesis:** An unauthenticated attacker can delete any member record and all associated renewal records by sending `GET /delete_members.php?id=N` with no session cookie. Combined with SQL injection on the `id` parameter, a UNION/stacked injection could enumerate and delete all members.
-- **Suggested Exploit Technique:** `unauthenticated_destructive_access`
-- **Confidence:** High — Source code confirms no session guard. Live probe confirms no redirect to login (HTTP 302 to `manage_members.php` on missing `id` param, not to `index.php`).
-
----
-
-### AUTH-VULN-07: Unauthenticated PII Disclosure (Authentication_Bypass)
-
-- **Vulnerability Type:** Authentication_Bypass
-- **Source Endpoint:** `GET /print_membership_card.php`
-- **Vulnerable Code Location:** `print_membership_card.php:2-9` — `include('includes/config.php')` then immediately `$memberId = $_GET['id']` and SQL SELECT with JOIN, with zero session check before data access.
-- **Missing Defense:** Session guard completely absent. No `isset($_SESSION['user_id'])` check.
-- **Exploitation Hypothesis:** An unauthenticated attacker who requests `GET /print_membership_card.php?id=N` for any valid member ID will receive the full membership card HTML page rendering: full name, address, postcode/license number, membership type, photo, and expiry date — all without authentication.
-- **Suggested Exploit Technique:** `unauthenticated_data_access`
-- **Confidence:** High — Source code confirms no session guard at lines 1-9. When members exist in the database, the page renders PII without authentication.
-
----
-
-### AUTH-VULN-08: Broken Password Hashing (MD5, Unsalted) (Token_Management_Issue)
-
-- **Vulnerability Type:** Token_Management_Issue
-- **Source Endpoint:** `POST /index.php` (authentication), `POST /settings.php` (password change)
-- **Vulnerable Code Location:** `index.php:12` — `$hashed_password = md5($password)`; `settings.php:58-59` — `md5($currentPassword)` for verification, `md5($newPassword)` for storage. `init.sql:50` — `MD5('admin123')` for seed data.
-- **Missing Defense:** Modern password hashing algorithm (bcrypt, Argon2id, or PBKDF2) with per-user salt. MD5 is a general-purpose hash function with no computational cost, fully reversible via rainbow tables.
-- **Exploitation Hypothesis:** An attacker who extracts the `users.password` column via SQL injection will immediately reverse all password hashes to plaintext using freely available rainbow tables or tools like hashcat/john without any computational barrier.
-- **Suggested Exploit Technique:** `offline_hash_cracking` / `rainbow_table_lookup`
-- **Confidence:** High — Code directly confirms MD5 usage at `index.php:12`. MD5 hash of `admin123` = `0192023a7bbd73250516f069df18b500`.
-
----
-
-### AUTH-VULN-09: No Rate Limiting on Authentication Endpoints (Abuse_Defenses_Missing)
-
-- **Vulnerability Type:** Abuse_Defenses_Missing
-- **Source Endpoint:** `POST /index.php`
-- **Vulnerable Code Location:** `index.php:4-30` — Login handler executes immediately on each POST with no rate limit counter, no lockout logic, no CAPTCHA trigger, no account lockout field in `users` table schema (`init.sql:4-8`).
-- **Missing Defense:** Per-IP and/or per-account rate limiting, account lockout after N failed attempts, CAPTCHA, progressive backoff. No `login_attempts`, `locked_until`, or `last_attempt` columns exist in the `users` table.
-- **Exploitation Hypothesis:** An attacker can submit thousands of login attempts per minute against `POST /index.php` with different password values (brute force) or known credential lists (credential stuffing) without any throttling, lockout, or detection. The MD5 hashing (fast, cheap) means even brute-forcing directly against the login form is viable.
-- **Suggested Exploit Technique:** `brute_force_login` / `credential_stuffing`
-- **Confidence:** High — Live confirmed: 10 sequential failed login requests all returned HTTP 200 with no rate-limit response, no lockout indication, and no CAPTCHA.
-
----
-
-### AUTH-VULN-10: Logout Does Not Clear Client-Side Cookie (Session_Management_Flaw)
-
+### AUTH-VULN-02: Session Cookie Misconfiguration — No HttpOnly, Secure, or SameSite
 - **Vulnerability Type:** Session_Management_Flaw
-- **Source Endpoint:** `GET /logout.php`
-- **Vulnerable Code Location:** `logout.php:4-6` — `$_SESSION = array(); session_destroy();` — server-side session is destroyed but `setcookie(session_name(), '', time()-3600)` is never called. No `Set-Cookie` header with empty/expired PHPSESSID is returned in the logout response.
-- **Missing Defense:** `setcookie(session_name(), '', time()-3600, '/', '', false, true)` to expire the client-side PHPSESSID cookie on logout.
-- **Exploitation Hypothesis:** After a user logs out, their browser retains the `PHPSESSID` cookie with the old value. If an attacker captures this cookie value before logout (via XSS, network sniff, or shoulder-surfing), they may attempt replay; however, since the server-side session is destroyed on logout, replayed cookies are rejected. The primary risk is in shared-computer scenarios where a subsequent user's browser may attempt to use the leftover cookie before the PHP GC collects the (already destroyed) session file — in practice, session_destroy() makes the session invalid server-side, so this is lower severity. However, the client-side cookie persisting is non-compliant with best practice.
-- **Suggested Exploit Technique:** `session_replay_post_logout`
-- **Confidence:** Medium — Code confirmed (no setcookie call in logout.php). Live confirmed (no Set-Cookie in logout response). Server-side destruction limits practical exploitability to edge cases.
+- **Externally Exploitable:** true
+- **Source Endpoint:** ALL endpoints — session cookie issued on first request to any page
+- **Vulnerable Code Location:** `includes/config.php:14` — bare `session_start()` with no `session_set_cookie_params()` call. Confirmed live: `Set-Cookie: PHPSESSID=...; path=/` — no `HttpOnly`, `Secure`, or `SameSite` attributes.
+- **Missing Defense:** (a) No `HttpOnly` flag — session cookie is accessible to JavaScript, enabling theft via XSS. (b) No `Secure` flag — cookie transmitted over HTTP. (c) No `SameSite` attribute — cookie sent on cross-site requests (enables CSRF-based session abuse).
+- **Exploitation Hypothesis:** An attacker who chains a stored XSS vulnerability (many exist in this app) can steal the admin's `PHPSESSID` cookie value via `document.cookie` and replay it to hijack the admin session, since there is no `HttpOnly` flag preventing JavaScript access.
+- **Suggested Exploit Technique:** session_hijacking via XSS-to-cookie-theft, or session theft via network interception.
+- **Confidence:** High
+- **Notes:** No `HttpOnly` confirmed from live header. `Secure` flag also absent (HTTP-only deployment). Pairs with AUTH-VULN-01 (no TLS) and the stored XSS findings from the recon report.
 
----
+### AUTH-VULN-03: Session Fixation — No Session ID Rotation After Login
+- **Vulnerability Type:** Login_Flow_Logic
+- **Externally Exploitable:** true
+- **Source Endpoint:** `POST /index.php`
+- **Vulnerable Code Location:** `index.php:17-24` — session variables set (`$_SESSION['user_id']`, `$_SESSION['email']`), then redirect to `dashboard.php`. `session_regenerate_id()` is never called anywhere in `index.php` or `includes/config.php`.
+- **Missing Defense:** No call to `session_regenerate_id(true)` after successful authentication. The pre-login session ID is directly promoted to an authenticated session.
+- **Exploitation Hypothesis:** An attacker can pre-plant a known `PHPSESSID` value (by sending a request to the app and capturing the session ID, then sharing that URL/cookie with a victim), wait for the victim admin to log in using that session, and then use the same known `PHPSESSID` to access the application as the authenticated admin — without ever knowing the admin's password. Confirmed live: a pre-seeded PHPSESSID remained valid after login and provided full dashboard access.
+- **Suggested Exploit Technique:** session_fixation
+- **Confidence:** High
+- **Notes:** Confirmed via live testing: a session ID obtained before login was used to send the login POST request; no new `Set-Cookie` header was issued on the login response; the original session ID subsequently granted full authenticated dashboard access (`HTTP 200`). The cookie also lacks `SameSite`, making it easier to deliver in cross-site scenarios.
+
+### AUTH-VULN-04: Default Credentials Publicly Exposed
+- **Vulnerability Type:** Token_Management_Issue
+- **Externally Exploitable:** true
+- **Source Endpoint:** `GET /uploads/01%20LOGIN%20DETAILS%20%26%20PROJECT%20INFO.txt` (credential file); `GET /DATABASE%20FILE/membershiphp.sql` (DB dump with hash)
+- **Vulnerable Code Location:** `uploads/01 LOGIN DETAILS & PROJECT INFO.txt` — web-accessible plaintext file containing admin credentials. `DATABASE FILE/membershiphp.sql:153` — MD5 hash `f2d0ff370380124029c2b807a924156c`. Both files served by Apache as static files with no access restriction.
+- **Missing Defense:** No `.htaccess` or Apache configuration to deny access to `uploads/01 LOGIN DETAILS...txt` or the `DATABASE FILE/` directory. Credential files were committed to and deployed in the web root.
+- **Exploitation Hypothesis:** Any unauthenticated attacker can download the plaintext credential file at `http://host.docker.internal:9010/uploads/01%20LOGIN%20DETAILS%20%26%20PROJECT%20INFO.txt` to immediately obtain the admin password `codeastro.com`, then use it to authenticate via `POST /index.php` and gain full admin access.
+- **Suggested Exploit Technique:** credential_stuffing / direct login with exposed default credentials.
+- **Confidence:** High
+- **Notes:** Confirmed live: HTTP 200 response with plaintext content including `Email: admin@mail.com` / `Password: codeastro.com`. DB dump also accessible: `GET /DATABASE%20FILE/membershiphp.sql` returns HTTP 200. MD5 hash `f2d0ff370380124029c2b807a924156c` verified to be MD5 of `codeastro.com`.
+
+### AUTH-VULN-05: Weak Password Hashing (MD5, Unsalted)
+- **Vulnerability Type:** Login_Flow_Logic
+- **Externally Exploitable:** true
+- **Source Endpoint:** `POST /index.php` (login), `POST /settings.php` (changePassword)
+- **Vulnerable Code Location:** `index.php:12` — `$hashed_password = md5($password);` | `settings.php:58-59` — `if (md5($currentPassword) === $hashedPassword)` and `$hashedNewPassword = md5($newPassword);`
+- **Missing Defense:** MD5 is a fast, cryptographically broken hash algorithm with no salting and no work factor. Any MD5 hash can be instantly reversed via rainbow tables or GPU-accelerated cracking. No `password_hash()` (bcrypt/Argon2) is used anywhere.
+- **Exploitation Hypothesis:** An attacker who obtains the MD5 password hash from the publicly accessible database dump (`/DATABASE FILE/membershiphp.sql`) can immediately reverse it using online rainbow table lookup (e.g., crackstation.net) to recover the plaintext admin password, then log in via the normal login form.
+- **Suggested Exploit_Technique:** offline_hash_cracking (rainbow table lookup against MD5 hash obtained from the public DB dump).
+- **Confidence:** High
+- **Notes:** Hash `f2d0ff370380124029c2b807a924156c` = MD5 of `codeastro.com` (verified). This is a trivially reversible hash. Even if the admin changes the password to a strong one, any new MD5 hash is still vulnerable to offline cracking. No password complexity policy enforced server-side.
+
+### AUTH-VULN-06: SQL Injection Authentication Bypass
+- **Vulnerability Type:** Authentication_Bypass
+- **Externally Exploitable:** true
+- **Source Endpoint:** `POST /index.php`
+- **Vulnerable Code Location:** `index.php:6,14` — `$email = $_POST['email']` directly concatenated into `$sql = "SELECT * FROM users WHERE email = '$email' AND password = '$hashed_password'"` with no escaping, parameterization, or prepared statements.
+- **Missing Defense:** No prepared statements, no `mysqli_real_escape_string()`, no input validation. Raw user input is concatenated directly into SQL.
+- **Exploitation Hypothesis:** An attacker can log in as the admin without any valid credentials by submitting the SQL injection payload `' OR '1'='1' -- -` as the email value (with any password), causing the query to return all rows and bypass the credential check. Confirmed live: sending this payload results in HTTP 302 redirect to `dashboard.php` (successful login).
+- **Suggested Exploit Technique:** SQL injection authentication bypass (`' OR '1'='1' -- -` as email field).
+- **Confidence:** High
+- **Notes:** Confirmed live. The injected condition `OR '1'='1'` causes `num_rows == 1` check to pass (first row returned). `$_SESSION['user_id']` and `$_SESSION['email']` are populated from the first user row. No prepared statements anywhere in the codebase.
+
+### AUTH-VULN-07: No Rate Limiting on Authentication Endpoints
+- **Vulnerability Type:** Abuse_Defenses_Missing
+- **Externally Exploitable:** true
+- **Source Endpoint:** `POST /index.php`, `POST /settings.php` (changePassword)
+- **Vulnerable Code Location:** `index.php:4-29` (login handler) — no rate limiting, no lockout, no CAPTCHA. `settings.php:44-71` (changePassword handler) — same. `includes/config.php` — no session-based attempt counter. No WAF, no reverse proxy, no Apache mod_evasive.
+- **Missing Defense:** No per-IP or per-account rate limiting, no exponential backoff, no account lockout, no CAPTCHA, no attempt counter, no monitoring/alerting for failed login spikes.
+- **Exploitation Hypothesis:** An attacker can submit thousands of login requests per second to `POST /index.php` with different password values (or use credential stuffing with a leaked credential list) without being throttled, locked out, or challenged, enabling them to brute-force the admin password at full network speed. Confirmed live: 10 rapid failed attempts all returned HTTP 200 with no lockout or throttle.
+- **Suggested Exploit Technique:** brute_force_login / credential_stuffing.
+- **Confidence:** High
+- **Notes:** No WAF, no reverse proxy, no application-level rate limiting anywhere. With MD5 hashing on server side and no salt, even online brute force against the login form is fast. Pairs with AUTH-VULN-05 (MD5 hashes are fast to compute).
+
+### AUTH-VULN-08: Missing Authentication on Sensitive Endpoints
+- **Vulnerability Type:** Authentication_Bypass
+- **Externally Exploitable:** true
+- **Source Endpoint:** `GET /print_membership_card.php`, `GET /delete_members.php`, `GET /get_membership_amount.php`
+- **Vulnerable Code Location:** `print_membership_card.php` — no `isset($_SESSION['user_id'])` check anywhere in the file. `delete_members.php` — no auth check; DELETE SQL executes without authentication. `get_membership_amount.php` — no auth check.
+- **Missing Defense:** The `isset($_SESSION['user_id'])` guard that protects all other endpoints is completely absent from these three files.
+- **Exploitation Hypothesis:** An unauthenticated attacker can (a) enumerate all member PII by requesting `GET /print_membership_card.php?id=1`, `?id=2`, etc. without any session cookie, and (b) permanently delete any member record by requesting `GET /delete_members.php?id=1` without any authentication. Confirmed live: both endpoints returned HTTP 200/302 respectively with no session cookie.
+- **Suggested Exploit_Technique:** Direct unauthenticated access to sensitive endpoints (authentication bypass by omission).
+- **Confidence:** High
+- **Notes:** Three distinct endpoints confirmed live. `print_membership_card.php` exposes full member PII (name, address, membership number, photo). `delete_members.php` executes cascading DELETEs against `renew` and `members` tables. `get_membership_amount.php` is lower sensitivity but also has SQLi. All confirmed accessible without `PHPSESSID` cookie.
+

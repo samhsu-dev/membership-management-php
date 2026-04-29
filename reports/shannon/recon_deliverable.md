@@ -1,165 +1,229 @@
-# Reconnaissance Deliverable: EHTDA Membership Management System
+# Reconnaissance Deliverable: PHP Membership Management System
 
 ## 0) HOW TO READ THIS
+
 This reconnaissance report provides a comprehensive map of the application's attack surface, with special emphasis on authorization and privilege escalation opportunities for the Authorization Analysis Specialist.
 
 **Key Sections for Authorization Analysis:**
-- **Section 4 (API Endpoint Inventory):** Contains authorization details for each endpoint — focus on "Required Role" and "Object ID Parameters" columns to identify IDOR candidates.
-- **Section 6.4 (Guards Directory):** Catalog of authorization controls — understand what each guard means before analyzing vulnerabilities.
-- **Section 7 (Role & Privilege Architecture):** Complete role hierarchy and privilege mapping — use this to understand the privilege lattice and identify escalation targets.
-- **Section 8 (Authorization Vulnerability Candidates):** Pre-prioritized lists of endpoints for horizontal, vertical, and context-based authorization testing.
+- **Section 4 (API Endpoint Inventory):** Contains authorization details for each endpoint — focus on "Required Role" and "Object ID Parameters" columns to identify IDOR candidates. Three endpoints have NO authentication at all.
+- **Section 6.4 (Guards Directory):** Catalog of authorization controls — the only guard that exists is a single `isset($_SESSION['user_id'])` check; there are NO role guards.
+- **Section 7 (Role & Privilege Architecture):** This application has NO role system — a single flat user tier exists. The entire authorization model is binary: authenticated vs unauthenticated.
+- **Section 8 (Authorization Vulnerability Candidates):** Every authenticated endpoint is an IDOR candidate since there are no object-ownership checks. Three unauthenticated endpoints allow direct data access and destruction.
 
-**How to Use the Network Mapping (Section 6):** The entity/flow mapping shows system boundaries and data sensitivity levels. Pay special attention to flows marked with authorization guards and entities handling PII/sensitive data.
+**How to Use the Network Mapping (Section 6):** The application is a PHP flat-file monolith with no framework, no routing layer, and no middleware. Every `.php` file in the web root IS an endpoint. The only security boundary is a per-file `isset($_SESSION['user_id'])` check — and this is absent from three critical endpoints.
 
-**Priority Order for Testing:** Start with Section 8's High-priority unauthenticated access candidates, then horizontal IDOR-style candidates, then vertical escalation (all authenticated users share a single flat role — there is no vertical escalation by role, but unauthenticated-vs-authenticated is the primary boundary), then context-based workflow bypasses.
+**Priority Order for Testing:** Start with the three unauthenticated endpoints (`print_membership_card.php`, `delete_members.php`, `get_membership_amount.php`) for immediate exploitation. Then test all authenticated endpoints for IDOR since no ownership checks exist anywhere.
 
 ---
 
 ## 1. Executive Summary
 
-The EHTDA Membership Management System is a membership administration portal built for the Ethiopian Heavy Truck Drivers Association (EHTDA). Its core purpose is tracking member records, membership types, renewal histories, and generating financial and membership reports.
+The target is a **PHP 7.4 membership management application** — a flat-file procedural PHP monolith deployed on Apache 2.4.54 (Debian) accessible at `http://host.docker.internal:9010`. The application manages member records (name, address, PII, membership type, renewal history) for a single administrative user.
 
-**Technology Stack:** Raw PHP 8.1 with no framework, Apache web server, MySQL 8.0 database, AdminLTE 3 Bootstrap UI template with jQuery DataTables. No Composer dependencies. No framework routing layer.
+**Core Technology Stack:** PHP 7.4.33 (EOL), Apache 2.4.54, MySQL 8.4, no framework, no routing layer, no MVC separation. HTML is rendered inline via PHP `echo`/`include`.
 
-**Architecture:** 19 standalone PHP files directly accessible at the document root. No front controller. Every `.php` file is independently reachable by direct HTTP request. One `includes/` subdirectory contains a shared `config.php` that initializes the MySQL connection and starts the PHP session.
+**Primary User-Facing Components:**
+- Login/Logout (single admin account)
+- Member management (add, edit, delete, view, print membership card)
+- Membership type management (add, edit, delete)
+- Renewal tracking (renew member, list renewals)
+- Reporting (membership report, revenue report)
+- Settings (system name, currency, logo, password change)
+- Three unauthenticated public endpoints
 
-**Primary Attack Surface Components:**
-- Login page (`index.php`) — single authentication entry point
-- Member management CRUD (`add_members.php`, `edit_member.php`, `delete_members.php`, `manage_members.php`, `memberProfile.php`)
-- Membership card printing (`print_membership_card.php`) — **unauthenticated**
-- Membership type management (`add_type.php`, `edit_type.php`, `delete_membership.php`, `view_type.php`)
-- Renewal management (`renew.php`, `list_renewal.php`, `get_membership_amount.php`) — the last is **unauthenticated**
-- Reporting (`report.php`, `revenue_report.php`)
-- Settings/file upload (`settings.php`)
-
-**Critical Security Posture:** The application is critically deficient in every security domain. There are no prepared statements, no output encoding, no CSRF tokens, no file upload validation, MD5 password hashing, three endpoints with no authentication guard, and a flat single-role authorization model with no RBAC.
+**Critical Security Profile:** The application is critically deficient across every security domain. Every SQL query uses raw string concatenation (universal SQL injection). Three endpoints have no authentication whatsoever. No CSRF protection, no input validation, no output encoding, no security headers, and file uploads accept PHP webshells without restriction. The MySQL connection runs as root.
 
 ---
 
 ## 2. Technology & Service Map
 
-- **Frontend:** Inline PHP/HTML template rendering; AdminLTE 3 (Bootstrap 4-based admin template); jQuery; DataTables plugin; Ionic Framework icons (CDN); Google Fonts (CDN). No JavaScript framework. No build system.
-- **Backend:** PHP 8.1, procedural style, `mysqli` extension exclusively (no PDO, no ORM). Raw string-interpolated SQL queries throughout. No third-party PHP libraries (no Composer).
-- **Infrastructure:** Apache httpd (mod_rewrite enabled), Docker container, MySQL 8.0. Application connects to MySQL as `root` with password `rootpass`. HTTP only (port 80); no TLS.
-- **Identified Subdomains:** None. Application runs on a single host (`host.docker.internal`) with no subdomains identified.
+- **Frontend:** Plain HTML rendered inline via PHP `echo`. Vendored libraries: jQuery 3.4.1 (CVE-2019-11358, CVE-2020-11022/11023), jQuery UI 1.12.1 (CVE-2021-41182/41183/41184), Bootstrap 4.4.1 (CVE-2024-6485), DataTables 1.10.20, AdminLTE 3.0.5. External CDN loads: `ionicframework.com/ionicons/2.0.1/css/ionicons.min.css`, `fonts.googleapis.com/css?family=Source+Sans+Pro`.
+- **Backend:** PHP 7.4.33 (EOL November 2022), procedural style, zero framework. MySQLi procedural/OOP. No Composer, no autoloader, no dependency injection.
+- **Infrastructure:** Apache/2.4.54 (Debian), HTTP only (no TLS), port 9010. MySQL 8.4 (Docker). Docker Compose deployment. No CDN, no WAF, no reverse proxy. No `.htaccess` files. No security headers.
+- **Identified Subdomains:** None. Single host at `host.docker.internal:9010`.
 - **Open Ports & Services:**
-  - `TCP 9010` — Apache/PHP 8.1 (the primary application, mapped from container port 80)
-  - `TCP 3306` — MySQL 8.0 (internal to Docker network, not externally exposed per docker-compose.yml; app connects as `root`/`rootpass`)
+  - Port 9010/TCP: HTTP — Apache/2.4.54 PHP/7.4.33 application (confirmed live)
+  - MySQL: Internal Docker network only (not exposed externally)
+
+**Confirmed Live Server Headers:**
+```
+Server: Apache/2.4.54 (Debian)
+X-Powered-By: PHP/7.4.33
+Set-Cookie: PHPSESSID=...; path=/   (no HttpOnly, no Secure, no SameSite)
+```
+No `Strict-Transport-Security`, `Content-Security-Policy`, `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`, or `Permissions-Policy` headers present.
 
 ---
 
 ## 3. Authentication & Session Management Flow
 
 - **Entry Points:**
-  - `POST /index.php` — sole login form; no registration, no SSO, no password reset, no OAuth
-  - `GET /logout.php` — session destruction
+  - `POST /index.php` — login form (fields: `email`, `password`, `login` button)
+  - `GET /logout.php` — logout (no CSRF protection)
+  - `POST /settings.php` (action: `changePassword`) — password change for authenticated admin
+  - **No registration endpoint exists.** New user accounts require direct database insertion.
+  - **No password reset endpoint exists.** No forgot-password flow, no email sending, no token generation.
 
 - **Mechanism (Step-by-Step):**
-  1. User submits `email` and `password` fields via POST to `index.php`
-  2. Server computes `md5($password)` (line 12 of `index.php`) — no salt, broken algorithm
-  3. Server executes: `SELECT * FROM users WHERE email = '$email' AND password = '$hashed_password'` (line 14) — both fields raw-interpolated (SQL injection vector)
-  4. If `num_rows == 1`, server sets `$_SESSION['user_id'] = $row['id']` and `$_SESSION['email'] = $row['email']` (lines 20–21)
-  5. Server redirects to `dashboard.php` via `header("Location: dashboard.php")` (line 23)
-  6. PHP native sessions via `PHPSESSID` cookie. Cookie flags: **no HttpOnly**, **no Secure**, **no SameSite**. No `session_regenerate_id()` call after login (session fixation risk).
-  7. `logout.php` calls `session_destroy()` and `$_SESSION = array()` but does NOT delete the client-side `PHPSESSID` cookie.
-
-- **Session Cookie Observed (Live):** `PHPSESSID=<hex>` (domain: host.docker.internal, path: /, no security flags)
+  1. User submits POST to `/index.php` with `email` and `password`
+  2. `index.php` line 12: password is hashed with `md5($password)` (no salt)
+  3. `index.php` line 14: raw SQL query `SELECT * FROM users WHERE email = '$email' AND password = '$hashed_password'` — both fields directly concatenated (SQL injection)
+  4. If 1 row returned: `$_SESSION['user_id'] = $row['id']` (line 20), `$_SESSION['email'] = $row['email']` (line 21)
+  5. Redirect to `dashboard.php` (line 23)
+  6. `session_regenerate_id()` is **never called** — session fixation is possible
+  7. Session cookie set by PHP defaults: `PHPSESSID=...; path=/` (no HttpOnly forced in code, no Secure, no SameSite)
 
 - **Code Pointers:**
-  - Login handler: `/repos/MembershipManagementSystemPHP/index.php` lines 4–30
-  - Logout handler: `/repos/MembershipManagementSystemPHP/logout.php` lines 1–10
-  - Session start: `/repos/MembershipManagementSystemPHP/includes/config.php` line 2 (`session_start()`)
-
-- **Default Credentials (from `init.sql` line 50):** `admin@test.com` / `admin123`
+  - `index.php` lines 4-30: Full login handler
+  - `includes/config.php` lines 14: `session_start()` (only session configuration)
+  - `logout.php` lines 4-8: `$_SESSION = array()`, `session_destroy()`, redirect to `index.php`
 
 ### 3.1 Role Assignment Process
 
-- **Role Determination:** No roles exist. After login, only `$_SESSION['user_id']` and `$_SESSION['email']` are set. There is no role column in the `users` table and no role stored in the session.
-- **Default Role:** The `users` table schema (from `init.sql` lines 4–8) contains only `id`, `email`, `password`. All authenticated users are implicitly system administrators with full access to all functions.
-- **Role Upgrade Path:** Not applicable — no role hierarchy exists.
-- **Code Implementation:** `/repos/MembershipManagementSystemPHP/index.php` lines 20–21; `/repos/MembershipManagementSystemPHP/init.sql` lines 4–8 (table definition)
+- **Role Determination:** None. The `users` table has no role column (`id`, `email`, `password`, `registration_date`, `updated_date` only). There is no role concept in this application.
+- **Default Role:** "Authenticated" — all users have identical, unrestricted access to all functionality.
+- **Role Upgrade Path:** Not applicable. No roles exist.
+- **Code Implementation:** `includes/config.php` line 14 (`session_start()`); `index.php` lines 20-21 (session write). No role assignment logic anywhere.
 
 ### 3.2 Privilege Storage & Validation
 
-- **Storage Location:** PHP native server-side session. `$_SESSION['user_id']` is the only privilege indicator — its mere presence grants full application access.
-- **Validation Points:** Guard is `if (!isset($_SESSION['user_id'])) { header("Location: index.php"); exit(); }`. Present in 16 of 19 files. **Absent in `delete_members.php`, `print_membership_card.php`, and `get_membership_amount.php`.**
-- **Cache/Session Persistence:** PHP default session lifetime (until browser close or server-side expiry). No explicit `session.gc_maxlifetime` override observed.
-- **Code Pointers:** Guard pattern at lines 4–7 of most protected files; `/repos/MembershipManagementSystemPHP/includes/config.php` line 2
+- **Storage Location:** PHP file-based session storage (`/tmp`). Session stores only `user_id` (integer) and `email` (string). No role, no privilege level, no permissions stored.
+- **Validation Points:** Each protected PHP file contains an inline check: `if (!isset($_SESSION['user_id'])) { header("Location: index.php"); exit(); }`. This is the **only** authorization gate in the entire application.
+- **Cache/Session Persistence:** PHP default `session.gc_maxlifetime` (typically 1440 seconds). No explicit timeout configured anywhere.
+- **Code Pointers:** Inline check in each protected file (e.g., `dashboard.php` line 4, `add_members.php` line 4, etc.). **Missing entirely from:** `delete_members.php`, `print_membership_card.php`, `get_membership_amount.php`.
 
 ### 3.3 Role Switching & Impersonation
 
-- **Impersonation Features:** None.
-- **Role Switching:** None. No sudo mode, no temporary elevation.
-- **Audit Trail:** No security event logging anywhere in the application. No login attempt logging. DB errors echoed to browser rather than logged server-side.
-- **Code Implementation:** Not applicable.
+- **Impersonation Features:** None. No impersonation mechanism exists.
+- **Role Switching:** None. No roles exist.
+- **Audit Trail:** No logging of any kind exists in the application.
+- **Code Implementation:** N/A.
 
 ---
 
 ## 4. API Endpoint Inventory
 
-**Network Surface Focus:** Only network-accessible endpoints served by the Apache/PHP application on port 9010. All 19 PHP files are directly reachable at the document root.
+**Network Surface Focus:** All PHP files reside directly in the Apache document root — every `.php` file is a network-accessible endpoint. There is no routing layer.
 
 | Method | Endpoint Path | Required Role | Object ID Parameters | Authorization Mechanism | Description & Code Pointer |
 |---|---|---|---|---|---|
-| GET, POST | `/index.php` | anon | None | None | Login form. SQL injection on `email`. See `index.php` lines 4–30. |
-| GET | `/logout.php` | anon | None | None | Session destruction. No CSRF protection. See `logout.php`. |
-| GET | `/dashboard.php` | auth | None | `isset($_SESSION['user_id'])` at lines 4–7 | Dashboard with statistics. See `dashboard.php`. |
-| GET | `/manage_members.php` | auth | None | `isset($_SESSION['user_id'])` at lines 8–11 (after DB query at line 4) | Member list table. Stored XSS output. See `manage_members.php`. |
-| GET, POST | `/add_members.php` | auth | None | `isset($_SESSION['user_id'])` at lines 4–7 | Add member form. SQL injection on all POST fields + file upload RCE. See `add_members.php` lines 23–50. |
-| GET, POST | `/edit_member.php` | auth | `id` (GET) | `isset($_SESSION['user_id'])` at lines 4–7 | Edit member by ID. SQL injection on `$_GET['id']` + all POST fields. No ownership check. See `edit_member.php` lines 14–61. |
-| GET | `/delete_members.php` | **NONE** | `id` (GET) | **NO SESSION GUARD** | Deletes member and renewals. Unauthenticated DELETE. SQL injection on `$_GET['id']`. See `delete_members.php` lines 33–48. |
-| GET | `/memberProfile.php` | auth | `id` (GET) | `isset($_SESSION['user_id'])` at lines 4–7 | View member profile. SQL injection on `$_GET['id']`. No ownership check. See `memberProfile.php` lines 10–16. |
-| GET | `/print_membership_card.php` | **NONE** | `id` (GET) | **NO SESSION GUARD** | Renders full membership card with PII. Unauthenticated. SQL injection on `$_GET['id']` (no isset check). See `print_membership_card.php` lines 4–9. |
-| GET, POST | `/renew.php` | auth | `id` (GET) | `isset($_SESSION['user_id'])` at lines 4–7 | Renew membership. SQL injection on `$_GET['id']`, `$_POST['membershipType']`, `$_POST['totalAmount']`. Amount tampered client-side. See `renew.php` lines 15–40. |
-| GET | `/list_renewal.php` | auth | None | `isset($_SESSION['user_id'])` at lines 7–10 (after DB query at line 4) | Renewal list. Stored XSS. See `list_renewal.php`. |
-| GET | `/get_membership_amount.php` | **NONE** | `membershipTypeId` (GET) | **NO SESSION GUARD** | JSON AJAX endpoint. Returns membership amount. SQL injection on `$_GET['membershipTypeId']`. See `get_membership_amount.php` lines 10–15. |
-| GET | `/view_type.php` | auth | None | `isset($_SESSION['user_id'])` at lines 7–10 (after DB query at line 4) | Membership types list. Stored XSS. See `view_type.php`. |
-| GET, POST | `/add_type.php` | auth | None | `isset($_SESSION['user_id'])` at lines 4–7 | Add membership type. SQL injection on `$_POST['membershipType']`, `$_POST['membershipAmount']`. See `add_type.php` lines 12–15. |
-| GET, POST | `/edit_type.php` | auth | `id` (GET), `edit_id` (POST) | `isset($_SESSION['user_id'])` at lines 4–7 | Edit membership type. SQL injection on GET `id` and all POST fields. No ownership check. See `edit_type.php` lines 12–29. |
-| GET | `/delete_membership.php` | auth | `id` (GET) | `isset($_SESSION['user_id'])` at lines 4–7 | Delete membership type. SQL injection on `$_GET['id']`. Open redirect via `HTTP_REFERER`. See `delete_membership.php` lines 10–22. |
-| POST | `/report.php` | auth | None | `isset($_SESSION['user_id'])` at lines 4–7 | Date-range member report. SQL injection on `$_POST['fromDate']`, `$_POST['toDate']`. See `report.php` lines 10–17. |
-| POST | `/revenue_report.php` | auth | None | `isset($_SESSION['user_id'])` at lines 4–7 | Date-range revenue report. SQL injection on `$_POST['fromDate']`, `$_POST['toDate']`. See `revenue_report.php` lines 10–18. |
-| GET, POST | `/settings.php` | auth | None | `isset($_SESSION['user_id'])` at lines 4–7 | System settings + password change. SQL injection on `$_POST['systemName']`, `$_POST['currency']`. Unrestricted file upload (verbatim filename) to `uploads/`. See `settings.php` lines 10–35. |
-| GET | `/includes/config.php` | anon | None | None | Shared DB init file. Web-accessible but PHP executes silently (outputs nothing). Contains DB credentials. See `includes/config.php`. |
+| GET | `/index.php` | anon | None | None | Login form render. `index.php` |
+| POST | `/index.php` | anon | None | None | Login handler. SQLi on `email`. `index.php:14` |
+| GET | `/logout.php` | anon | None | None | Destroys session. No CSRF protection. `logout.php:4-8` |
+| GET | `/print_membership_card.php` | **NONE (unauthenticated)** | `id` (member ID) | **NO AUTH CHECK** | Renders full member PII. Anyone can access. `print_membership_card.php:4-8` |
+| GET | `/get_membership_amount.php` | **NONE (unauthenticated)** | `membershipTypeId` | **NO AUTH CHECK** | Returns membership type amount as JSON. `get_membership_amount.php:10-14` |
+| GET | `/delete_members.php` | **NONE (unauthenticated)** | `id` (member ID) | **NO AUTH CHECK** | Permanently deletes member record and renewals. `delete_members.php:33-46` |
+| GET | `/dashboard.php` | user | None | `isset($_SESSION['user_id'])` line 4 | Dashboard with stats. `dashboard.php` |
+| GET | `/manage_members.php` | user | None | `isset($_SESSION['user_id'])` line 8 | Member list DataTable. DB query runs before auth check (line 4). `manage_members.php` |
+| GET | `/add_members.php` | user | None | `isset($_SESSION['user_id'])` line 4 | Add member form. `add_members.php` |
+| POST | `/add_members.php` | user | None | `isset($_SESSION['user_id'])` line 4 | Insert new member + file upload. SQLi all fields. `add_members.php:45-48` |
+| GET | `/edit_member.php` | user | `id` (member ID) | `isset($_SESSION['user_id'])` line 4 | Load member for editing. SQLi via `id`. No ownership check. `edit_member.php:15-17` |
+| POST | `/edit_member.php` | user | `id` (GET param) | `isset($_SESSION['user_id'])` line 4 | Update member record + file upload. SQLi all POST fields + `id`. No ownership check. `edit_member.php:59` |
+| GET | `/memberProfile.php` | user | `id` (member ID) | `isset($_SESSION['user_id'])` line 4 | View member profile + PII. SQLi via `id`. No ownership check. `memberProfile.php:10-15` |
+| GET | `/add_type.php` | user | None | `isset($_SESSION['user_id'])` line 4 | Add membership type form. `add_type.php` |
+| POST | `/add_type.php` | user | None | `isset($_SESSION['user_id'])` line 4 | Insert membership type. SQLi on `membershipType`. `add_type.php:15` |
+| GET | `/view_type.php` | user | None | `isset($_SESSION['user_id'])` line 7 | Membership types DataTable. DB query before auth check. `view_type.php:4-7` |
+| POST | `/view_type.php` | user | None | `isset($_SESSION['user_id'])` line 7 | Dead code: orphaned POST handler inserts into `membership_types`. `view_type.php:24-25` |
+| GET | `/edit_type.php` | user | `id` (type ID) | `isset($_SESSION['user_id'])` line 4 | Load membership type. SQLi via `id`. `edit_type.php:27-28` |
+| POST | `/edit_type.php` | user | `edit_id` (POST) | `isset($_SESSION['user_id'])` line 4 | Update membership type. SQLi on all POST fields. `edit_type.php:17` |
+| GET | `/delete_membership.php` | user | `id` (type ID) | `isset($_SESSION['user_id'])` line 4 | Delete membership type. SQLi via `id`. Open redirect via `HTTP_REFERER`. `delete_membership.php:10-15` |
+| GET | `/renew.php` | user | `id` (member ID) | `isset($_SESSION['user_id'])` line 4 | Load member for renewal. SQLi via `id`. No ownership check. `renew.php:15-17` |
+| POST | `/renew.php` | user | `id` (GET param) | `isset($_SESSION['user_id'])` line 4 | Process renewal. SQLi on `id`, `membershipType`, `totalAmount`. Client-controlled price. `renew.php:34,39` |
+| GET | `/list_renewal.php` | user | None | `isset($_SESSION['user_id'])` line 7 | Renewal list DataTable. DB query before auth check. `list_renewal.php:4-7` |
+| GET | `/report.php` | user | None | `isset($_SESSION['user_id'])` line 4 | Membership report form. `report.php` |
+| POST | `/report.php` | user | None | `isset($_SESSION['user_id'])` line 4 | Generate member report by date range. SQLi on `fromDate`/`toDate`. `report.php:13-16` |
+| GET | `/revenue_report.php` | user | None | `isset($_SESSION['user_id'])` line 4 | Revenue report form. `revenue_report.php` |
+| POST | `/revenue_report.php` | user | None | `isset($_SESSION['user_id'])` line 4 | Generate revenue report by date range. SQLi on `fromDate`/`toDate`. `revenue_report.php:13-17` |
+| GET | `/settings.php` | user | None | `isset($_SESSION['user_id'])` line 4 | Settings form. `settings.php` |
+| POST | `/settings.php` (updateSettings) | user | None | `isset($_SESSION['user_id'])` line 4 | Update system name, currency, logo upload. SQLi + unrestricted file upload. `settings.php:10-33` |
+| POST | `/settings.php` (changePassword) | user | None | `isset($_SESSION['user_id'])` line 4 | Change admin password. MD5 hashing. `settings.php:44-72` |
+| GET | `/includes/config.php` | anon | None | None | Returns blank page (session_start + DB connect). No direct output but PHP executed. |
+
+**Web-Accessible Static Files (No Auth Required):**
+| URL | Status | Risk |
+|---|---|---|
+| `GET /uploads/01%20LOGIN%20DETAILS%20%26%20PROJECT%20INFO.txt` | 200 | **Admin credentials publicly downloadable** (`admin@mail.com` / `codeastro.com`) |
+| `GET /uploads/member_photos/*` | 200 | Member photos and potentially uploaded webshells are web-accessible |
+| `GET /DATABASE%20FILE/membershiphp.sql` | 200 | Full database dump with admin password hash downloadable |
+| `GET /uploads/` | 403 | Directory listing disabled |
+| `GET /plugins/` | 403 | Directory listing disabled |
 
 ---
 
 ## 5. Potential Input Vectors for Vulnerability Analysis
 
-**Network Surface Focus:** All vectors below are reachable via HTTP to `http://host.docker.internal:9010/`.
-
 ### URL Parameters (GET)
-- `index.php` — No GET parameters
-- `edit_member.php?id=` — Member record identifier (integer). File: `edit_member.php` line 15. Flows into SELECT and UPDATE queries.
-- `delete_members.php?id=` — Member ID to delete (no auth). File: `delete_members.php` line 33. Flows into DELETE query.
-- `memberProfile.php?id=` — Member profile ID. File: `memberProfile.php` line 10. Flows into SELECT query.
-- `print_membership_card.php?id=` — Member card ID (no auth, no isset check). File: `print_membership_card.php` line 4. Flows into SELECT query.
-- `renew.php?id=` — Member ID for renewal. File: `renew.php` line 15. Flows into SELECT and DML queries.
-- `get_membership_amount.php?membershipTypeId=` — Membership type ID (no auth). File: `get_membership_amount.php` line 10. Flows into SELECT query.
-- `edit_type.php?id=` — Membership type ID. File: `edit_type.php` line 27. Flows into SELECT query.
-- `delete_membership.php?id=` — Membership type ID to delete. File: `delete_membership.php` line 10. Flows into DELETE query.
+
+| Endpoint | Parameter | Type | Used In | File:Line |
+|---|---|---|---|---|
+| `/index.php` | None | — | — | — |
+| `/print_membership_card.php` | `id` | Integer (untyped) | SQL: `WHERE members.id = $memberId` | `print_membership_card.php:4,8` |
+| `/get_membership_amount.php` | `membershipTypeId` | Integer (untyped) | SQL: `WHERE id = $membershipTypeId` | `get_membership_amount.php:10,14` |
+| `/delete_members.php` | `id` | Integer (untyped) | SQL: `WHERE member_id = $memberId` and `WHERE id = $memberId` | `delete_members.php:33,35,46` |
+| `/edit_member.php` | `id` | Integer (untyped) | SQL: `WHERE id = $memberId`, reused in POST UPDATE | `edit_member.php:15,17,59` |
+| `/memberProfile.php` | `id` | Integer (untyped) | SQL: `WHERE members.id = $memberId` (JOIN query) | `memberProfile.php:10,15` |
+| `/edit_type.php` | `id` | Integer (untyped, null-coalesced) | SQL: `WHERE id = $edit_id` | `edit_type.php:27,28` |
+| `/delete_membership.php` | `id` | Integer (untyped, null-coalesced) | SQL: `WHERE id = $delete_id` | `delete_membership.php:10,12` |
+| `/renew.php` | `id` | Integer (untyped) | SQL: `WHERE id = $memberId` (SELECT + UPDATE + INSERT) | `renew.php:15,17,34,39` |
 
 ### POST Body Fields
-- `index.php` — `email` (line 6, flows into SQL query, primary SQLi vector), `password` (line 7, MD5-hashed before query)
-- `add_members.php` — `fullname` (line 23), `dob` (line 24), `gender` (line 25), `contactNumber` (line 26), `email` (line 27), `address` (line 28), `country` (line 29), `postcode` (line 30), `occupation` (line 31), `membershipType` (line 32) — all flow raw into INSERT query at lines 45–48
-- `edit_member.php` — `fullname` (line 37), `dob` (line 38), `gender` (line 39), `contactNumber` (line 40), `email` (line 41), `address` (line 42), `country` (line 43), `postcode` (line 44), `occupation` (line 45) — all flow raw into UPDATE query at lines 56–59
-- `renew.php` — `membershipType` (line 29), `extend` (line 30), `totalAmount` (line 37) — `totalAmount` is client-controlled amount in INSERT; `membershipType` unquoted in UPDATE
-- `add_type.php` — `membershipType` (line 12), `membershipAmount` (line 13) — both flow into INSERT at line 15
-- `edit_type.php` — `membershipType` (line 12), `membershipAmount` (line 13), `edit_id` (line 15) — all flow raw into UPDATE at line 17
-- `report.php` — `fromDate` (line 10), `toDate` (line 11) — both interpolated into BETWEEN clause at line 16
-- `revenue_report.php` — `fromDate` (line 10), `toDate` (line 11) — both interpolated into BETWEEN clause at line 17
-- `settings.php` — `systemName` (line 10), `currency` (line 11) — raw in UPDATE at lines 21/33; `currentPassword` (line 46), `newPassword` (line 47), `confirmPassword` (line 48) — password change (confirmPassword never validated against newPassword)
 
-### File Upload Inputs
-- `add_members.php` — `$_FILES['photo']` (line 37): extension extracted from `$_FILES['photo']['name']` via `pathinfo()` and preserved in destination filename. Upload path: `uploads/member_photos/`. File: `add_members.php` lines 36–40.
-- `edit_member.php` — `$_FILES['photo']` (line 48): original basename + extension preserved in destination filename. Upload path: `uploads/member_photos/`. File: `edit_member.php` lines 48–52.
-- `settings.php` — `$_FILES['logo']` (line 13): **entire raw filename used verbatim** as destination (`uploads/<filename>`). No sanitization whatsoever. File: `settings.php` lines 14, 19–20. **Highest severity upload vector.**
+| Endpoint | Field Name | Type | Used In | File:Line |
+|---|---|---|---|---|
+| `/index.php` | `email` | String | SQL: `WHERE email = '$email'` | `index.php:6,14` |
+| `/index.php` | `password` | String | MD5 then SQL: `AND password = '$hashed_password'` | `index.php:7,12,14` |
+| `/add_members.php` | `fullname` | String | SQL INSERT, HTML echo (Stored XSS) | `add_members.php:23,47` |
+| `/add_members.php` | `dob` | String | SQL INSERT | `add_members.php:24,47` |
+| `/add_members.php` | `gender` | String | SQL INSERT | `add_members.php:25,47` |
+| `/add_members.php` | `contactNumber` | String | SQL INSERT, HTML echo (Stored XSS) | `add_members.php:26,47` |
+| `/add_members.php` | `email` | String | SQL INSERT, HTML echo (Stored XSS) | `add_members.php:27,47` |
+| `/add_members.php` | `address` | String | SQL INSERT, HTML echo (Stored XSS) | `add_members.php:28,47` |
+| `/add_members.php` | `country` | String | SQL INSERT, HTML echo (Stored XSS) | `add_members.php:29,47` |
+| `/add_members.php` | `postcode` | String | SQL INSERT, HTML echo (Stored XSS) | `add_members.php:30,47` |
+| `/add_members.php` | `occupation` | String | SQL INSERT, HTML echo (Stored XSS) | `add_members.php:31,47` |
+| `/add_members.php` | `membershipType` | Integer | SQL INSERT | `add_members.php:32,47` |
+| `/add_members.php` | `photo` (file) | File upload | `move_uploaded_file()` to `uploads/member_photos/` — no validation | `add_members.php:36-40` |
+| `/edit_member.php` | `fullname` | String | SQL UPDATE, HTML echo (Stored XSS) | `edit_member.php:37,59` |
+| `/edit_member.php` | `dob` | String | SQL UPDATE | `edit_member.php:38,59` |
+| `/edit_member.php` | `gender` | String | SQL UPDATE | `edit_member.php:39,59` |
+| `/edit_member.php` | `contactNumber` | String | SQL UPDATE | `edit_member.php:40,59` |
+| `/edit_member.php` | `email` | String | SQL UPDATE | `edit_member.php:41,59` |
+| `/edit_member.php` | `address` | String | SQL UPDATE | `edit_member.php:42,59` |
+| `/edit_member.php` | `country` | String | SQL UPDATE | `edit_member.php:43,59` |
+| `/edit_member.php` | `postcode` | String | SQL UPDATE | `edit_member.php:44,59` |
+| `/edit_member.php` | `occupation` | String | SQL UPDATE | `edit_member.php:45,59` |
+| `/edit_member.php` | `photo` (file) | File upload | `move_uploaded_file()` to `uploads/member_photos/` — no validation | `edit_member.php:48-54` |
+| `/add_type.php` | `membershipType` | String | SQL INSERT | `add_type.php:12,15` |
+| `/add_type.php` | `membershipAmount` | Numeric | SQL INSERT (unquoted) | `add_type.php:13,15` |
+| `/edit_type.php` | `membershipType` | String | SQL UPDATE | `edit_type.php:12,17` |
+| `/edit_type.php` | `membershipAmount` | Numeric | SQL UPDATE (unquoted) | `edit_type.php:13,17` |
+| `/edit_type.php` | `edit_id` | Integer | SQL UPDATE `WHERE id = $id` | `edit_type.php:15,17` |
+| `/renew.php` | `membershipType` | Integer | SQL UPDATE | `renew.php:29,34` |
+| `/renew.php` | `extend` | Integer | `strtotime("+$renewDuration months")` | `renew.php:30,32` |
+| `/renew.php` | `totalAmount` | Decimal | SQL INSERT `total_amount = $totalAmount` (client-controlled price) | `renew.php:37,39` |
+| `/report.php` | `fromDate` | String | SQL BETWEEN clause | `report.php:10,16` |
+| `/report.php` | `toDate` | String | SQL BETWEEN clause | `report.php:11,16` |
+| `/revenue_report.php` | `fromDate` | String | SQL BETWEEN clause | `revenue_report.php:10,17` |
+| `/revenue_report.php` | `toDate` | String | SQL BETWEEN clause | `revenue_report.php:11,17` |
+| `/settings.php` | `systemName` | String | SQL UPDATE, HTML echo ALL pages via sidebar (Persistent XSS) | `settings.php:10,21,33` |
+| `/settings.php` | `currency` | String | SQL UPDATE, HTML echo revenue reports | `settings.php:11,21,33` |
+| `/settings.php` | `logo` (file) | File upload | `move_uploaded_file()` to `uploads/$logoName` (original name, path traversal) | `settings.php:13-20` |
+| `/settings.php` | `currentPassword` | String | MD5 comparison | `settings.php:46,58` |
+| `/settings.php` | `newPassword` | String | MD5 hash + SQL UPDATE | `settings.php:47,59,60` |
+| `/settings.php` | `confirmPassword` | String | **Read but never compared to `newPassword`** — logic bug | `settings.php:48` |
 
 ### HTTP Headers
-- `$_SERVER['HTTP_REFERER']` — Used as redirect target in `delete_membership.php` lines 15 and 22. Fully attacker-controlled. Open redirect vector. Potentially usable for SSRF if any internal redirect validation were added.
+
+| Header | Endpoint | Usage | File:Line |
+|---|---|---|---|
+| `Referer` (`$_SERVER['HTTP_REFERER']`) | `/delete_membership.php` | Used directly in `header("Location: ...")` — open redirect | `delete_membership.php:15,22` |
+| `Cookie: PHPSESSID` | All protected pages | Session authentication | All protected files via `includes/config.php:14` |
 
 ### Cookie Values
-- `PHPSESSID` — PHP session identifier. No `HttpOnly`, `Secure`, or `SameSite` flags. Susceptible to XSS-based theft and network sniffing. No session fixation protection.
+
+| Cookie | Usage | Risk |
+|---|---|---|
+| `PHPSESSID` | PHP session ID — passed as `PHPSESSID=<value>; path=/`. No `HttpOnly`, `Secure`, or `SameSite` flags set in code. Session fixation possible (no `session_regenerate_id()`). | Session hijacking, fixation |
 
 ---
 
@@ -169,60 +233,56 @@ The EHTDA Membership Management System is a membership administration portal bui
 
 | Title | Type | Zone | Tech | Data | Notes |
 |---|---|---|---|---|---|
-| UserBrowser | Identity | Internet | Any browser | Public | External user/attacker interacting with the application |
-| EHTDA-WebApp | Service | App | Apache/PHP 8.1 | PII, Tokens, Secrets | Main application backend; all 19 PHP files; runs on port 9010 |
-| MySQL-DB | DataStore | Data | MySQL 8.0 | PII, Tokens, Secrets | Stores members, users, renewals, settings; app connects as root/rootpass |
-| uploads-dir | ExternAsset | App | Filesystem/Apache | PII | Web-accessible directory for uploaded files (photos, logos); path traversal risk |
-| includes-dir | ExternAsset | App | Filesystem/Apache | Secrets | Contains config.php with DB credentials; web-accessible but PHP execution hides plaintext |
-| Ionic-CDN | ThirdParty | ThirdParty | CDN | Public | Ionic framework icons loaded from external CDN |
-| GoogleFonts-CDN | ThirdParty | ThirdParty | CDN | Public | Google Fonts loaded from external CDN |
+| UserBrowser | Identity | Internet | Any browser | Public | External attacker or admin user |
+| MembershipApp | Service | App | Apache/2.4.54, PHP/7.4.33 | PII, Tokens, Secrets | Flat-file PHP monolith; entire repo is web root; no framework |
+| MySQLDB | DataStore | Data | MySQL 8.4 (Docker) | PII, Tokens, Secrets | Connected as `root` user with full privileges; latin1 charset |
+| UploadsDir | ExternAsset | App | Apache static file serving | PII | `uploads/` — web-accessible; contains admin credentials text file; no PHP execution restriction |
+| IonicsCDN | ThirdParty | ThirdParty | CDN (ionicframework.com) | Public | Loads ionicons CSS on every page; supply-chain risk |
+| GoogleFontsCDN | ThirdParty | ThirdParty | CDN (fonts.googleapis.com) | Public | Loads Source Sans Pro font on every page; IP leakage |
 
 ### 6.2 Entity Metadata
 
 | Title | Metadata Key: Value |
 |---|---|
-| EHTDA-WebApp | Host: `http://host.docker.internal:9010`; Files: 19 PHP files at docroot; Auth: PHP Session (PHPSESSID); DB: MySQL via mysqli as root; Session: `session_start()` in `includes/config.php` line 2; TLS: None (HTTP only) |
-| MySQL-DB | Engine: `MySQL 8.0`; Exposure: Internal Docker network only; Credentials: `root`/`rootpass` (hardcoded in docker-compose.yml and includes/config.php fallback); Tables: `users`, `members`, `membership_types`, `renew`, `settings`; Port: 3306 |
-| uploads-dir | Path: `uploads/` (relative to docroot); Subdirs: `member_photos/`; Served by Apache; No `.htaccess` restriction; PHP files uploaded here are executable |
-| includes-dir | Path: `includes/` (relative to docroot); Files: `config.php` (+ missing partial templates); No `deny from all`; config.php web-accessible (PHP executes, outputs nothing but errors if DB fails) |
+| MembershipApp | Host: `http://host.docker.internal:9010`; Endpoints: All `.php` files in web root; Auth: `PHPSESSID` cookie (bare `session_start()`); DB Connection: MySQLi as root; PHP Version: 7.4.33 (EOL); Web Server: Apache/2.4.54 (Debian); No TLS, no `.htaccess`, no security headers |
+| MySQLDB | Engine: MySQL 8.4; Charset: latin1 (all tables); Exposure: Internal Docker network only; Credentials: root / rootpass (committed to docker-compose.yml); Tables: `members`, `membership_types`, `renew`, `settings`, `users`; App connects as root (full DDL + FILE privileges) |
+| UploadsDir | Path: `uploads/` (web root); Subdirs: `uploads/member_photos/`; No `.htaccess`; No PHP execution restriction; Contains: `01 LOGIN DETAILS & PROJECT INFO.txt` (admin credentials), `mlg.png`, member photos, potential webshells; Web-accessible URL: `http://host.docker.internal:9010/uploads/` |
 
-### 6.3 Flows
+### 6.3 Flows (Connections)
 
 | FROM → TO | Channel | Path/Port | Guards | Touches |
 |---|---|---|---|---|
-| UserBrowser → EHTDA-WebApp | HTTP | `:9010 /index.php` | None | Public (email, password) |
-| UserBrowser → EHTDA-WebApp | HTTP | `:9010 /logout.php` | None | Tokens (session destruction) |
-| UserBrowser → EHTDA-WebApp | HTTP | `:9010 /dashboard.php` | auth:user | PII (member counts, names) |
-| UserBrowser → EHTDA-WebApp | HTTP | `:9010 /manage_members.php` | auth:user | PII (member list) |
-| UserBrowser → EHTDA-WebApp | HTTP | `:9010 /add_members.php` | auth:user | PII (new member data), file upload |
-| UserBrowser → EHTDA-WebApp | HTTP | `:9010 /edit_member.php?id=N` | auth:user | PII (member data), file upload |
-| UserBrowser → EHTDA-WebApp | HTTP | `:9010 /delete_members.php?id=N` | **None** | PII (deletion of member record) |
-| UserBrowser → EHTDA-WebApp | HTTP | `:9010 /memberProfile.php?id=N` | auth:user | PII (full member profile) |
-| UserBrowser → EHTDA-WebApp | HTTP | `:9010 /print_membership_card.php?id=N` | **None** | PII (full card: name, address, license, photo) |
-| UserBrowser → EHTDA-WebApp | HTTP | `:9010 /renew.php?id=N` | auth:user | PII, Payments (renewal amount) |
-| UserBrowser → EHTDA-WebApp | HTTP | `:9010 /list_renewal.php` | auth:user | PII (renewal list) |
-| UserBrowser → EHTDA-WebApp | HTTP | `:9010 /get_membership_amount.php?membershipTypeId=N` | **None** | Public (pricing data) |
-| UserBrowser → EHTDA-WebApp | HTTP | `:9010 /view_type.php` | auth:user | Public (membership types) |
-| UserBrowser → EHTDA-WebApp | HTTP | `:9010 /add_type.php` | auth:user | Public (membership type creation) |
-| UserBrowser → EHTDA-WebApp | HTTP | `:9010 /edit_type.php?id=N` | auth:user | Public (membership type edit) |
-| UserBrowser → EHTDA-WebApp | HTTP | `:9010 /delete_membership.php?id=N` | auth:user | Public (membership type deletion) |
-| UserBrowser → EHTDA-WebApp | HTTP | `:9010 /report.php` | auth:user | PII (member report) |
-| UserBrowser → EHTDA-WebApp | HTTP | `:9010 /revenue_report.php` | auth:user | Payments, PII (revenue report) |
-| UserBrowser → EHTDA-WebApp | HTTP | `:9010 /settings.php` | auth:user | Secrets (system name, currency, logo upload) |
-| UserBrowser → EHTDA-WebApp | HTTP | `:9010 /includes/config.php` | None | Secrets (web-accessible; PHP hides source) |
-| EHTDA-WebApp → MySQL-DB | TCP | `:3306` | app-internal | PII, Tokens, Secrets |
-| EHTDA-WebApp → uploads-dir | File | local filesystem | None | PII (photos), potential Secrets (uploaded PHP shells) |
+| UserBrowser → MembershipApp | HTTP | `:9010 /index.php` | None | Public |
+| UserBrowser → MembershipApp | HTTP | `:9010 /print_membership_card.php?id=X` | **None** (no auth) | PII |
+| UserBrowser → MembershipApp | HTTP | `:9010 /delete_members.php?id=X` | **None** (no auth) | PII |
+| UserBrowser → MembershipApp | HTTP | `:9010 /get_membership_amount.php?membershipTypeId=X` | **None** (no auth) | Public |
+| UserBrowser → MembershipApp | HTTP | `:9010 /dashboard.php` | auth:user | Public |
+| UserBrowser → MembershipApp | HTTP | `:9010 /manage_members.php` | auth:user | PII |
+| UserBrowser → MembershipApp | HTTP | `:9010 /add_members.php (POST)` | auth:user | PII |
+| UserBrowser → MembershipApp | HTTP | `:9010 /edit_member.php?id=X` | auth:user | PII |
+| UserBrowser → MembershipApp | HTTP | `:9010 /memberProfile.php?id=X` | auth:user | PII |
+| UserBrowser → MembershipApp | HTTP | `:9010 /settings.php (POST updateSettings)` | auth:user | Secrets, PII |
+| UserBrowser → MembershipApp | HTTP | `:9010 /settings.php (POST changePassword)` | auth:user | Secrets |
+| UserBrowser → MembershipApp | HTTP | `:9010 /renew.php?id=X` | auth:user | PII |
+| UserBrowser → MembershipApp | HTTP | `:9010 /report.php (POST)` | auth:user | PII |
+| UserBrowser → MembershipApp | HTTP | `:9010 /revenue_report.php (POST)` | auth:user | PII |
+| UserBrowser → UploadsDir | HTTP | `:9010 /uploads/01%20LOGIN%20DETAILS%20...txt` | None | Secrets |
+| UserBrowser → UploadsDir | HTTP | `:9010 /uploads/member_photos/*.php` | None | RCE vector |
+| MembershipApp → MySQLDB | TCP | Docker internal network | vpc-only | PII, Tokens, Secrets |
+| MembershipApp → IonicsCDN | HTTPS | External | None | Public |
+| MembershipApp → GoogleFontsCDN | HTTPS | External | None | Public |
 
 ### 6.4 Guards Directory
 
 | Guard Name | Category | Statement |
 |---|---|---|
-| auth:user | Auth | Requires `$_SESSION['user_id']` to be set. Implemented as `if (!isset($_SESSION['user_id'])) { header("Location: index.php"); exit(); }` at lines 4–7 in most protected files. |
-| no-guard | Auth | No session check. Present on `delete_members.php`, `print_membership_card.php`, `get_membership_amount.php`. Any HTTP request (authenticated or not) is processed. |
-| guard-after-query | Auth | Session guard is present but placed AFTER an initial database query executes. Present in `manage_members.php` (guard at line 8, query at line 4), `list_renewal.php` (guard at line 7, query at line 4), `view_type.php` (guard at line 7, query at line 4). Data is fetched before authentication is verified. |
-| no-ownership-check | Authorization | No object ownership verification. For endpoints accepting object IDs (`edit_member.php?id=`, `memberProfile.php?id=`, `renew.php?id=`, `edit_type.php?id=`, `delete_membership.php?id=`), any authenticated user can access/modify any object without verifying they own or are authorized to act on it. |
-| no-csrf | Protocol | No CSRF tokens on any form or state-changing endpoint. All 13+ forms and all GET-based delete operations lack CSRF protection. |
-| no-rbac | Authorization | No role-based access control exists. All authenticated users share identical privileges. There is no admin-only section. |
+| auth:user | Auth | Requires `isset($_SESSION['user_id'])` — checks only that session key exists. Implemented as inline check at top of each protected PHP file. No role, no token validation, no expiry. |
+| no-auth | Auth | Three endpoints (`print_membership_card.php`, `delete_members.php`, `get_membership_amount.php`) have NO authentication guard whatsoever. |
+| vpc-only | Network | MySQL is only accessible within the Docker internal network — not directly exposed to the host. |
+| session:fixation-risk | Protocol | No `session_regenerate_id()` on login — pre-login session ID becomes the authenticated session ID. |
+| cookie:insecure | Protocol | `PHPSESSID` cookie has no `Secure`, `HttpOnly` (not enforced in code), or `SameSite` flags. Transmitted over HTTP only. |
+| no-csrf | Protocol | Zero CSRF protection anywhere in the application. No tokens, no SameSite cookies, no origin validation. All state-changing operations are CSRF-vulnerable. |
+| no-idor-check | ObjectOwnership | No endpoint verifies that the requesting user is authorized to access the requested object. Any authenticated user can access any object by ID enumeration. |
 
 ---
 
@@ -232,41 +292,50 @@ The EHTDA Membership Management System is a membership administration portal bui
 
 | Role Name | Privilege Level | Scope/Domain | Code Implementation |
 |---|---|---|---|
-| anon | 0 | Global | No `$_SESSION['user_id']`. Access to: `index.php`, `logout.php`, `delete_members.php` (no guard!), `print_membership_card.php` (no guard!), `get_membership_amount.php` (no guard!), `includes/config.php` |
-| auth | 1 | Global | `$_SESSION['user_id']` is set after successful login. Grants access to ALL 16 remaining files. No sub-roles exist. Effectively a superuser. |
+| anon | 0 | Global | No authentication required. Three network-accessible endpoints require no auth: `print_membership_card.php`, `delete_members.php`, `get_membership_amount.php`. |
+| user (authenticated) | 1 | Global | `isset($_SESSION['user_id'])` check at top of each protected page. All functionality is accessible to any authenticated user — there is no higher role. |
 
-**Note:** There is **no admin role, no manager role, no hierarchical RBAC**. The `users` table has no role column. Any user in the `users` table has identical, unrestricted access to the entire application.
+**There is no admin role, no superuser role, no role hierarchy, and no role column in the `users` table.** The authorization model is strictly binary: authenticated or unauthenticated.
 
 ### 7.2 Privilege Lattice
 
 ```
 Privilege Ordering (→ means "can access resources of"):
-anon → auth (all resources)
+anon → user(authenticated)
 
 Parallel Isolation:
-None. Single flat privilege level for all authenticated users.
+None — single-tier system
 
-Unauthenticated access to protected resources (implementation bug, not design):
-anon → delete_members.php (intended: auth, guard missing)
-anon → print_membership_card.php (intended: auth, guard missing)
-anon → get_membership_amount.php (possibly intentional AJAX endpoint)
+Accessible to anon (no auth required):
+  - /index.php (login form)
+  - /logout.php
+  - /print_membership_card.php?id=X  [CRITICAL: full PII exposure + SQLi]
+  - /delete_members.php?id=X         [CRITICAL: destructive write + SQLi]
+  - /get_membership_amount.php        [SQLi]
+  - /uploads/01 LOGIN DETAILS....txt [admin credentials]
+  - /DATABASE FILE/membershiphp.sql   [DB dump with password hash]
+
+Accessible to user(authenticated) only:
+  - All remaining 18 PHP endpoints
+  - All functionality (member CRUD, types, renewals, reports, settings)
+
+Note: No impersonation, no sudo mode, no role switching. Once authenticated, a session has
+full application access permanently until session expires or logout.
 ```
-
-**Note:** No role switching, no impersonation, no sudo mode exists.
 
 ### 7.3 Role Entry Points
 
 | Role | Default Landing Page | Accessible Route Patterns | Authentication Method |
 |---|---|---|---|
-| anon | `/index.php` (login) | `/index.php`, `/logout.php`, `/delete_members.php` (bug), `/print_membership_card.php` (bug), `/get_membership_amount.php`, `/includes/config.php` | None |
-| auth | `/dashboard.php` | All 19 PHP files | `PHPSESSID` session cookie containing `$_SESSION['user_id']` |
+| anon | `/index.php` | `/index.php`, `/logout.php`, `/print_membership_card.php`, `/delete_members.php`, `/get_membership_amount.php`, `/uploads/*`, `/DATABASE FILE/membershiphp.sql` | None |
+| user | `/dashboard.php` | All `.php` files in web root | `PHPSESSID` session cookie |
 
 ### 7.4 Role-to-Code Mapping
 
 | Role | Middleware/Guards | Permission Checks | Storage Location |
 |---|---|---|---|
-| anon | None | None | No session data required |
-| auth | `if (!isset($_SESSION['user_id'])) { header("Location: index.php"); exit(); }` at lines 4–7 of 16 files | Presence of `$_SESSION['user_id']` only — no further checks | PHP server-side session; session ID in `PHPSESSID` cookie (no security flags) |
+| anon | None | None | N/A |
+| user | Inline `isset($_SESSION['user_id'])` check at top of each PHP file | `!isset($_SESSION['user_id'])` → redirect to `index.php` + `exit()` | PHP file-based session (`/tmp/sess_*`); `$_SESSION['user_id']` + `$_SESSION['email']` |
 
 ---
 
@@ -274,164 +343,105 @@ anon → get_membership_amount.php (possibly intentional AJAX endpoint)
 
 ### 8.1 Horizontal Privilege Escalation Candidates
 
-The application has a single flat role, so there is no traditional horizontal escalation between user accounts (there is only one administrator account in the `users` table). However, the **member data** (PII) is the sensitive resource. Any authenticated user can access any member record without ownership validation. The three unauthenticated endpoints allow even unauthenticated access.
-
 | Priority | Endpoint Pattern | Object ID Parameter | Data Type | Sensitivity |
 |---|---|---|---|---|
-| High | `/print_membership_card.php?id=N` | id (GET) | member PII | Full name, address, license number, photo, membership type — unauthenticated access |
-| High | `/delete_members.php?id=N` | id (GET) | member record | Unauthenticated deletion of any member and their renewal history |
-| High | `/memberProfile.php?id=N` | id (GET) | member PII | Full member profile; no ownership check; authenticated but any auth user accesses any member |
-| High | `/edit_member.php?id=N` | id (GET) + POST | member PII | Edit any member's personal data; no ownership check |
-| Medium | `/renew.php?id=N` | id (GET) | member renewal + financial | Renew membership for any member; `totalAmount` is client-controlled POST field |
-| Medium | `/get_membership_amount.php?membershipTypeId=N` | membershipTypeId (GET) | pricing data | Unauthenticated; SQL injection on ID parameter |
-| Medium | `/edit_type.php?id=N` | id (GET), edit_id (POST) | membership type config | Edit any membership type; no ownership check |
-| Low | `/delete_membership.php?id=N` | id (GET) | membership type | Delete any membership type; no ownership check |
+| **Critical** | `/print_membership_card.php?id={id}` | `id` (member row ID) | PII (name, address, membership number, photo) | **Unauthenticated** — anyone can enumerate all member records |
+| **Critical** | `/delete_members.php?id={id}` | `id` (member row ID) | Destructive operation | **Unauthenticated** — anyone can delete any member record |
+| High | `/memberProfile.php?id={id}` | `id` (member row ID) | Full member PII | Any authenticated session can view any member's full profile |
+| High | `/edit_member.php?id={id}` | `id` (GET, reused in POST UPDATE) | Full member PII + photo | Any authenticated session can edit any member's record |
+| High | `/renew.php?id={id}` | `id` (member row ID) | Renewal/financial data | Any authenticated session can renew any member; `totalAmount` is client-controlled |
+| Medium | `/edit_type.php?id={id}` | `id` (membership type ID) | Membership configuration | Any authenticated session can edit any membership type |
+| Medium | `/delete_membership.php?id={id}` | `id` (membership type ID) | Membership configuration | Any authenticated session can delete any membership type |
+| Low | `/get_membership_amount.php?membershipTypeId={id}` | `membershipTypeId` | Membership pricing | **Unauthenticated** — low sensitivity but SQLi vector |
 
 ### 8.2 Vertical Privilege Escalation Candidates
 
-**No vertical escalation by role exists** — there is only one authenticated role. The primary vertical boundary is **unauthenticated → authenticated**. The following endpoints bypass this boundary entirely:
+The application has only one privilege tier (authenticated user). There is no "admin" role to escalate to. However, the following endpoints represent "all-powerful" functionality accessible to any authenticated user:
 
-| Target Level | Endpoint Pattern | Functionality | Risk Level |
-|---|---|---|---|
-| auth (bypassed) | `/delete_members.php?id=N` | Unauthenticated member deletion | Critical |
-| auth (bypassed) | `/print_membership_card.php?id=N` | Unauthenticated PII disclosure | High |
-| auth (bypassed) | `/get_membership_amount.php?membershipTypeId=N` | Unauthenticated pricing data + SQL injection | Medium |
-| auth (login bypass) | `/index.php` POST | SQL injection allows bypassing password check entirely: `email=' OR '1'='1'-- -` | Critical |
+| Functionality | Endpoint | Risk Level |
+|---|---|---|
+| System-wide settings (name, currency) | `POST /settings.php` (updateSettings) | High — affects all pages via persistent XSS in `system_name` |
+| Logo upload (PHP webshell to web root) | `POST /settings.php` (updateSettings, logo field) | **Critical** — RCE via PHP webshell upload |
+| Password change | `POST /settings.php` (changePassword) | High — can lock out the admin account |
+| Bulk member deletion via SQLi | `GET /delete_members.php?id=X OR 1=1` | Critical — unauthenticated mass deletion |
+| Database exfiltration via SQLi | Any endpoint with SQLi | Critical — MySQL root = full DB + FILE access |
 
-**Note:** All authenticated endpoints are effectively admin-equivalent. There is no lower-privilege user role to test for unauthorized admin access.
+**Note:** Since there is only one user account and no roles, any authenticated session IS the admin. Vertical escalation is not applicable — all escalation is lateral (unauthenticated → authenticated).
 
 ### 8.3 Context-Based Authorization Candidates
 
 | Workflow | Endpoint | Expected Prior State | Bypass Potential |
 |---|---|---|---|
-| Member Renewal | `POST /renew.php` | Member loaded via `GET /renew.php?id=N` first | POST without GET id leaves `$memberId` undefined; direct POST with crafted `membershipType` and `totalAmount` bypasses normal renewal flow |
-| Member Edit | `POST /edit_member.php` | Member loaded via `GET /edit_member.php?id=N` | POST without GET id — `$memberId` undefined, UPDATE WHERE clause malformed |
-| Password Change | `POST /settings.php` (changePassword) | currentPassword must match stored hash | `confirmPassword` is read but **never compared against `newPassword`** — password can be changed to a value that doesn't match the confirmation field |
-| File Upload | `POST /settings.php` (updateSettings) | Authenticated user | No MIME/extension validation; raw filename as destination path; path traversal via `../` in filename |
+| Multi-step member edit | `POST /edit_member.php` + `?id=X` | GET must load member first; `$memberId` comes from `$_GET['id']` and is reused in POST handler | POST can be sent without prior GET; `member_id` hidden form field is never read |
+| Multi-step renewal | `POST /renew.php` + `?id=X` | GET must load member; renewal amount calculated client-side | `totalAmount` is a POST field — send arbitrary renewal amount; `member_id` hidden field never validated server-side |
+| Membership type edit | `POST /edit_type.php` | GET must load type; `edit_id` sent as hidden field | `edit_id` in POST body is attacker-controlled — any authenticated user can UPDATE any row |
+| Password change | `POST /settings.php` (changePassword) | Must know current password | `confirmPassword` is read at line 48 but **never compared to `newPassword`** — password confirmation bypass |
+| Delete then redirect | `GET /delete_membership.php?id=X` | Should originate from `view_type.php` | `Referer` header is used as redirect target — open redirect after delete |
 
 ---
 
 ## 9. Injection Sources
 
-### SQL Injection Sources (All network-accessible, no prepared statements anywhere)
+### SQL Injection Sources
 
-**SQLi-01 — Login bypass (CRITICAL, unauthenticated)**
-- File: `/repos/MembershipManagementSystemPHP/index.php`, lines 6, 14–15
-- Source: `$_POST['email']` → `$email` → `"SELECT * FROM users WHERE email = '$email' AND password = '$hashed_password'"` → `$conn->query($sql)`
-- Table: `users`
+**UNAUTHENTICATED SQL Injection (Critical — no login required):**
 
-**SQLi-02 — Edit member GET id + POST fields (CRITICAL)**
-- File: `/repos/MembershipManagementSystemPHP/edit_member.php`, lines 15, 17, 37–45, 56–61
-- Sources: `$_GET['id']` → SELECT and UPDATE WHERE clause; `$_POST['fullname']`, `$_POST['dob']`, `$_POST['gender']`, `$_POST['contactNumber']`, `$_POST['email']`, `$_POST['address']`, `$_POST['country']`, `$_POST['postcode']`, `$_POST['occupation']` → UPDATE SET clause
-- Table: `members`
+| # | Source | Sink | Flow | File:Line |
+|---|---|---|---|---|
+| 1 | `$_GET['id']` | `WHERE members.id = $memberId` (SELECT JOIN) | `$memberId = $_GET['id']` → `$selectQuery = "... WHERE members.id = $memberId"` | `print_membership_card.php:4 → :8` |
+| 2 | `$_GET['id']` | `WHERE member_id = $memberId` (SELECT), `WHERE member_id = $memberId` (DELETE), `WHERE id = $memberId` (DELETE) | `$memberId = $_GET['id']` → 3 raw queries | `delete_members.php:33 → :35,:39,:46` |
+| 3 | `$_GET['membershipTypeId']` | `WHERE id = $membershipTypeId` (SELECT) | `$membershipTypeId = $_GET['membershipTypeId']` → raw query | `get_membership_amount.php:10 → :14` |
 
-**SQLi-03 — Add member INSERT (CRITICAL)**
-- File: `/repos/MembershipManagementSystemPHP/add_members.php`, lines 23–32, 45–50
-- Sources: `$_POST['fullname']`, `$_POST['dob']`, `$_POST['gender']`, `$_POST['contactNumber']`, `$_POST['email']`, `$_POST['address']`, `$_POST['country']`, `$_POST['postcode']`, `$_POST['occupation']`, `$_POST['membershipType']` → INSERT VALUES
-- Table: `members`
+**Authenticated SQL Injection:**
 
-**SQLi-04 — Delete member by GET id (CRITICAL, unauthenticated)**
-- File: `/repos/MembershipManagementSystemPHP/delete_members.php`, lines 33–48
-- Source: `$_GET['id']` → `$memberId` → three queries (SELECT, DELETE renew, DELETE member)
-- Tables: `renew`, `members`
+| # | Source | Sink | Flow | File:Line |
+|---|---|---|---|---|
+| 4 | `$_POST['email']` | `WHERE email = '$email'` | `$email = $_POST['email']` → `"... WHERE email = '$email' AND password = '...'` | `index.php:6 → :14` |
+| 5 | `$_GET['id']` | `WHERE id = $memberId` (SELECT + UPDATE) | `$memberId = $_GET['id']` → SELECT and POST UPDATE reuse same var | `edit_member.php:15 → :17,:59` |
+| 6 | `$_POST['fullname']` | `VALUES ('$fullname', ...)` INSERT | All 10 POST fields → raw INSERT string | `add_members.php:23-32 → :47` |
+| 7 | `$_POST['fullname']` through all POST fields | `SET fullname='$fullname',...` UPDATE | All 9 POST fields → raw UPDATE string | `edit_member.php:37-45 → :59` |
+| 8 | `$_GET['id']` | `WHERE id = $memberId` | `$memberId = $_GET['id']` → `"SELECT * FROM members WHERE id = $memberId"` | `memberProfile.php:10 → :15` |
+| 9 | `$_POST['membershipType']` | `VALUES ('$membershipType', ...)` INSERT | Direct concatenation | `add_type.php:12 → :15` |
+| 10 | `$_GET['id']` | `WHERE id = $edit_id` SELECT | Null-coalesced `$edit_id = $_GET['id'] ?? null` → raw query | `edit_type.php:27 → :28` |
+| 11 | `$_POST['membershipType']`, `$_POST['membershipAmount']`, `$_POST['edit_id']` | `SET type='$membershipType',...WHERE id = $id` UPDATE | All 3 POST fields → raw UPDATE | `edit_type.php:12-15 → :17` |
+| 12 | `$_GET['id']` | `WHERE id = $delete_id` DELETE | `$delete_id = $_GET['id'] ?? null` → raw DELETE | `delete_membership.php:10 → :12` |
+| 13 | `$_GET['id']` | SELECT + UPDATE + INSERT with `$memberId` and `$totalAmount` | `$memberId = $_GET['id']`; `$totalAmount = $_POST['totalAmount']` → raw queries | `renew.php:15,29-31 → :17,:34,:39` |
+| 14 | `$_POST['fromDate']`, `$_POST['toDate']` | `BETWEEN '$fromDate' AND '$toDate'` SELECT | Date fields → raw BETWEEN clause | `report.php:10-11 → :16` |
+| 15 | `$_POST['fromDate']`, `$_POST['toDate']` | `BETWEEN '$fromDate' AND '$toDate'` SELECT | Date fields → raw BETWEEN clause | `revenue_report.php:10-11 → :17` |
+| 16 | `$_POST['systemName']`, `$_POST['currency']` | `SET system_name='$systemName',...` UPDATE | Direct concatenation | `settings.php:10-11 → :21,:33` |
 
-**SQLi-05 — Delete membership type GET id (HIGH)**
-- File: `/repos/MembershipManagementSystemPHP/delete_membership.php`, lines 10, 12, 14
-- Source: `$_GET['id']` → `$delete_id` → `DELETE FROM membership_types WHERE id = $delete_id`
-- Table: `membership_types`
+### Unrestricted File Upload Sources (RCE via PHP Webshell)
 
-**SQLi-06 — Edit type GET id + POST fields (HIGH)**
-- File: `/repos/MembershipManagementSystemPHP/edit_type.php`, lines 12–17, 27–29
-- Sources: `$_GET['id']` → SELECT; `$_POST['membershipType']`, `$_POST['membershipAmount']`, `$_POST['edit_id']` → UPDATE
-- Table: `membership_types`
+| # | Source | Sink | Validation | Stored At | File:Line |
+|---|---|---|---|---|---|
+| 1 | `$_FILES['photo']` | `move_uploaded_file($tmp, 'uploads/member_photos/' . $uniquePhotoName)` | None (extension extracted with `pathinfo()` and used verbatim) | `uploads/member_photos/{timestamp}_{uniqid}.{ext}` | `add_members.php:36-40` |
+| 2 | `$_FILES['photo']` | `move_uploaded_file($tmp, 'uploads/member_photos/' . $uniquePhotoName)` | None | `uploads/member_photos/{basename}_{time}.{ext}` | `edit_member.php:48-54` |
+| 3 | `$_FILES['logo']['name']` | `move_uploaded_file($tmp, 'uploads/' . $logoName)` | None — original filename used as-is, no `basename()` call | `uploads/{original_filename}` (path traversal risk) | `settings.php:14-20` |
 
-**SQLi-07 — Add membership type POST fields (HIGH, three files)**
-- Files: `/repos/MembershipManagementSystemPHP/add_type.php` line 15; `/repos/MembershipManagementSystemPHP/manage_members.php` line 17; `/repos/MembershipManagementSystemPHP/view_type.php` line 27
-- Sources: `$_POST['membershipType']`, `$_POST['membershipAmount']` → INSERT VALUES
-- Table: `membership_types`
+### Open Redirect / HTTP Header Injection Sources
 
-**SQLi-08 — Renew member GET id + POST fields (HIGH)**
-- File: `/repos/MembershipManagementSystemPHP/renew.php`, lines 15, 17, 29, 34, 37, 39
-- Sources: `$_GET['id']` → SELECT, UPDATE WHERE, INSERT; `$_POST['membershipType']` → UPDATE SET; `$_POST['totalAmount']` → INSERT VALUES (amount manipulation)
-- Tables: `members`, `renew`
+| # | Source | Sink | Flow | File:Line |
+|---|---|---|---|---|
+| 1 | `$_SERVER['HTTP_REFERER']` | `header("Location: " . $_SERVER['HTTP_REFERER'])` | Attacker-controlled `Referer` header → `Location:` response header | `delete_membership.php:15` (success) and `:22` (else branch) |
 
-**SQLi-09 — Get membership amount GET id (HIGH, unauthenticated)**
-- File: `/repos/MembershipManagementSystemPHP/get_membership_amount.php`, lines 10, 14–15
-- Source: `$_GET['membershipTypeId']` → `$membershipTypeId` → `SELECT amount FROM membership_types WHERE id = $membershipTypeId`
-- Table: `membership_types`
+### Path Traversal Sources
 
-**SQLi-10 — Member profile GET id (HIGH)**
-- File: `/repos/MembershipManagementSystemPHP/memberProfile.php`, lines 10, 12–16
-- Source: `$_GET['id']` → `$memberId` → JOIN SELECT on `members` and `membership_types`
-- Tables: `members`, `membership_types`
+| # | Source | Sink | Flow | File:Line |
+|---|---|---|---|---|
+| 1 | `$_FILES['logo']['name']` | `move_uploaded_file($tmp, 'uploads/' . $logoName)` | `$logoName = $_FILES['logo']['name']` used without `basename()` — `../index.php` as filename would overwrite files outside `uploads/` | `settings.php:14-20` |
 
-**SQLi-11 — Print membership card GET id (CRITICAL, unauthenticated, no isset check)**
-- File: `/repos/MembershipManagementSystemPHP/print_membership_card.php`, lines 4, 5–9
-- Source: `$_GET['id']` → `$memberId` (no `isset()` check; undefined triggers PHP notice) → JOIN SELECT
-- Tables: `members`, `membership_types`
+### Stored XSS Injection Sources (for XSS Specialist)
 
-**SQLi-12 — Date-range member report POST (HIGH)**
-- File: `/repos/MembershipManagementSystemPHP/report.php`, lines 10–11, 13–17
-- Sources: `$_POST['fromDate']`, `$_POST['toDate']` → `BETWEEN '$fromDate' AND '$toDate'` in WHERE clause
-- Tables: `members`, `membership_types`
+**All database fields that echo to HTML without `htmlspecialchars()` — universal absence of output encoding:**
 
-**SQLi-13 — Date-range revenue report POST (HIGH)**
-- File: `/repos/MembershipManagementSystemPHP/revenue_report.php`, lines 10–11, 13–18
-- Sources: `$_POST['fromDate']`, `$_POST['toDate']` → `BETWEEN '$fromDate' AND '$toDate'` in WHERE clause
-- Tables: `renew`, `members`, `settings`
-
-**SQLi-14 — Settings UPDATE POST (HIGH)**
-- File: `/repos/MembershipManagementSystemPHP/settings.php`, lines 10–11, 14, 19–23, 33–35
-- Sources: `$_POST['systemName']` → `system_name = '$systemName'`; `$_POST['currency']` → `currency = '$currency'`; `$_FILES['logo']['name']` → `logo = '$targetPath'`
-- Table: `settings`
-
-### File Upload / Path Traversal Sources
-
-**FI-01 — Member photo upload, extension preserved (HIGH)**
-- File: `/repos/MembershipManagementSystemPHP/add_members.php`, lines 37–40
-- Source: `$_FILES['photo']['name']` → `pathinfo($name, PATHINFO_EXTENSION)` preserves extension → `move_uploaded_file($tmp, 'uploads/member_photos/<timestamp>_<uniqid>.<user_ext>')`
-- Risk: Uploading `evil.php` results in an executable PHP file at `uploads/member_photos/<timestamp>_<id>.php`
-
-**FI-02 — Member photo upload in edit, full basename preserved (HIGH)**
-- File: `/repos/MembershipManagementSystemPHP/edit_member.php`, lines 48–52
-- Source: `$_FILES['photo']['name']` → `generateUniqueFileName()` preserves original basename + extension → `move_uploaded_file($tmp, 'uploads/member_photos/<original_basename>_<time>.<ext>')`
-- Risk: Attacker controls both the filename and extension; PHP files placed in `uploads/member_photos/` are executable
-
-**FI-03 — Logo upload, fully verbatim filename (CRITICAL)**
-- File: `/repos/MembershipManagementSystemPHP/settings.php`, lines 14, 19–20
-- Source: `$_FILES['logo']['name']` → `$logoName` → `$targetPath = 'uploads/' . $logoName` → `move_uploaded_file($logoTmpName, $targetPath)`
-- Risk: Attacker uploads `shell.php` → stored at `uploads/shell.php` with complete filename control. No randomization, no extension check, path traversal possible with `../shell.php` to escape `uploads/`.
-
-### Open Redirect Sources
-
-**OR-01 — HTTP_REFERER open redirect (LOW)**
-- File: `/repos/MembershipManagementSystemPHP/delete_membership.php`, lines 15 and 22
-- Source: `$_SERVER['HTTP_REFERER']` (fully attacker-controlled request header) → `header("Location: " . $_SERVER['HTTP_REFERER'])` with no validation
-- Risk: Redirect to arbitrary external URL; useful in phishing chains
-
-### Command Injection
-- **None found.** No `exec()`, `system()`, `shell_exec()`, `passthru()`, `popen()`, `proc_open()`, or backtick operators exist in any PHP file.
-
-### SSTI / Template Injection
-- **None found.** No templating engine or `eval()` of user content.
-
-### Deserialization
-- **None found.** No `unserialize()` calls. `json_encode()` is used only for output (not deserialization of user input).
-
-### XSS Sinks (Stored, from DB; no htmlspecialchars() anywhere in codebase)
-
-All member fields (`fullname`, `dob`, `gender`, `contact_number`, `email`, `address`, `country`, `postcode`, `occupation`, `membership_number`, `membership_type`) and settings fields (`system_name`, `currency`, `logo`) are stored without sanitization and reflected without encoding.
-
-Key output files and lines:
-- `manage_members.php` lines 90–94 — table body echo
-- `memberProfile.php` lines 120–132 — profile field echo
-- `print_membership_card.php` lines 154–167 — card echo (unauthenticated)
-- `report.php` lines 87–91 — report table echo
-- `revenue_report.php` lines 87–90 — revenue table echo
-- `dashboard.php` lines 307, 310 — recent members list echo
-- `list_renewal.php` lines 83–88 — renewal table echo
-- `edit_member.php` lines 122, 126, 145, 150, 158, 163, 171 — value="" attribute echo (stored XSS breaking HTML context)
-- `edit_type.php` lines 78, 82 — value="" attribute echo
-- `view_type.php` lines 85–86 — table row echo
-- Reflected XSS: `memberProfile.php` lines 108, 112, 145 — `$_GET['id']` echoed into onclick attributes and href values without encoding
-- Reflected XSS: `edit_type.php` line 72 — `$_GET['id']` echoed into hidden input value attribute
+| Source Field | Written By | Read/Echoed By | HTML Context | File:Line (sink) |
+|---|---|---|---|---|
+| `members.fullname` | `add_members.php POST`, `edit_member.php POST` | `manage_members.php`, `memberProfile.php`, `dashboard.php`, `print_membership_card.php`, `renew.php`, `list_renewal.php`, `report.php` | HTML body, attribute values | Multiple (see pre-recon §9) |
+| `members.contact_number` | `add_members.php POST` | `manage_members.php`, `memberProfile.php`, `list_renewal.php` | HTML body | Multiple |
+| `members.email` | `add_members.php POST` | `manage_members.php`, `memberProfile.php`, `report.php` | HTML body | Multiple |
+| `members.address` | `add_members.php POST` | `memberProfile.php`, `manage_members.php`, `print_membership_card.php` | HTML body | Multiple |
+| `members.country`, `postcode`, `occupation` | `add_members.php POST` | `memberProfile.php` | HTML body | `memberProfile.php:129-131` |
+| `settings.system_name` | `settings.php POST` | `includes/header.php` (`<title>`), `includes/sidebar.php` | HTML body (ALL pages) | `includes/header.php:13`, `includes/sidebar.php:28` |
+| `settings.currency` | `settings.php POST` | `revenue_report.php`, `view_type.php` | HTML body | Multiple |
+| `membership_types.type` | `add_type.php POST`, `edit_type.php POST` | `view_type.php`, `memberProfile.php`, `manage_members.php` | HTML body | Multiple |
+| `$_GET['id']` (reflected) | N/A | `edit_type.php` hidden input | HTML attribute (`value=""`) | `edit_type.php:72` |

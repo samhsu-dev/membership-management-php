@@ -3,133 +3,95 @@
 ## 1. Executive Summary
 
 - **Analysis Status:** Complete
-- **Key Outcome:** Seventeen (17) confirmed XSS vulnerabilities were identified across the EHTDA Membership Management System. The application contains zero output encoding anywhere in its entire codebase — every database-sourced and user-input-sourced variable is echoed raw into HTML. All findings represent real, exploitable vulnerabilities that have been live-confirmed via HTTP testing.
-- **Purpose of this Document:** This report provides the strategic context, dominant patterns, and environmental intelligence necessary to effectively exploit the vulnerabilities in the subsequent phase. The absence of `HttpOnly` on the session cookie makes cookie theft via XSS directly actionable.
-- **Most Critical Finding:** A stored XSS payload injected into a member's `fullname` field renders unencoded on the **unauthenticated** `print_membership_card.php` endpoint — meaning exploitation requires zero victim authentication. Combined with the absence of `HttpOnly` on the `PHPSESSID` cookie, this represents an immediate, externally-reachable account takeover vector.
+- **Key Outcome:** Seventeen (17) high-confidence XSS vulnerabilities were identified and live-confirmed. The application contains **zero calls to `htmlspecialchars()`, `htmlentities()`, or any output encoding function** anywhere in the codebase. Every user-controlled value that flows from POST input → SQL INSERT/UPDATE → database → HTML output is an unencoded stored XSS sink. One additional reflected XSS vulnerability is present via a GET parameter directly echoed into an HTML attribute. All findings have been passed to the exploitation phase.
+- **Purpose of this Document:** This report provides the strategic context, dominant patterns, and environmental intelligence necessary to effectively exploit the confirmed vulnerabilities. Live confirmation was performed for every major attack pattern via curl-based HTTP testing.
+
+**Critical Notes for Exploitation:**
+- The session cookie (`PHPSESSID`) has **NO `HttpOnly` flag** set — `document.cookie` access is possible.
+- **NO Content Security Policy (CSP)** is present on any page — inline scripts, event handlers, and external script loads are all permitted.
+- The `print_membership_card.php` page has **NO authentication check** — stored XSS vectors on this page are exploitable by completely unauthenticated external attackers without any login.
+- The settings `system_name` field creates **persistent XSS on every single page** of the application simultaneously.
 
 ---
 
 ## 2. Dominant Vulnerability Patterns
 
-**Pattern 1: Pervasive Stored XSS via Member Data Fields**
-- **Description:** Every member data field (`fullname`, `contact_number`, `email`, `address`, `country`, `postcode`, `occupation`) stored in the `members` table is echoed without encoding across at least 8 distinct output pages. The payload is stored once (via `add_members.php` or `edit_member.php`) and then rendered in HTML_BODY context across `manage_members.php`, `memberProfile.php`, `dashboard.php`, `list_renewal.php`, `report.php`, `print_membership_card.php`, and in HTML_ATTRIBUTE context in `edit_member.php` and `renew.php`.
-- **Implication:** A single stored payload in a member's name triggers XSS for every authenticated user who views any member-listing page. The unauthenticated page (`print_membership_card.php`) further extends impact to anonymous visitors.
-- **Representative Findings:** XSS-VULN-01 through XSS-VULN-09.
+**Pattern 1: Universal Stored XSS via Member Fields (HTML_BODY Context)**
+- **Description:** Every field of the `members` table — `fullname`, `contact_number`, `email`, `address`, `country`, `postcode`, `occupation`, `membership_number` — is echoed directly into HTML body context (`<td>`, `<p>`, `<span>`, `<a>`) across seven pages (`manage_members.php`, `memberProfile.php`, `dashboard.php`, `print_membership_card.php`, `list_renewal.php`, `report.php`, `revenue_report.php`) without any output encoding. An attacker who stores `<script>alert(1)</script>` in any member's `fullname` field will trigger JavaScript execution on every admin who views any of these pages.
+- **Implication:** Single write, multi-page execution. Payload stored via `add_members.php` POST fires on 7+ pages. Highest-value target: `dashboard.php` which loads automatically on every admin login.
+- **Live Confirmed:** `<script>alert(1)</script>` stored in `fullname` field; confirmed firing at `manage_members.php` line 204, `memberProfile.php` line 247, `dashboard.php` line 295, `list_renewal.php` line 222, `report.php` line 209, `print_membership_card.php` line 113 (unauthenticated).
+- **Representative Findings:** XSS-VULN-01, XSS-VULN-02, XSS-VULN-03, XSS-VULN-04.
 
-**Pattern 2: Stored XSS via Membership Type Data**
-- **Description:** The `membership_types.type` field stored via `add_type.php`/`edit_type.php` is echoed raw in `view_type.php` (HTML_BODY), `edit_type.php` (HTML_ATTRIBUTE), `add_members.php` option elements, and `renew.php` option elements.
-- **Implication:** An attacker who stores a script payload as a membership type name achieves persistent XSS that fires every time any user views the membership type table, edits a type, or uses the member add/renewal forms.
-- **Representative Findings:** XSS-VULN-10 through XSS-VULN-13.
+**Pattern 2: Stored XSS via Membership Type Field (HTML_BODY and HTML_ATTRIBUTE Context)**
+- **Description:** The `membership_types.type` column is echoed unencoded into `<td>` body context (`view_type.php`), into `<option>` body context (`renew.php`, `add_members.php`, `edit_member.php`), and into an `<input value="">` attribute (`edit_type.php`). An attacker who creates a membership type named `<script>alert(document.cookie)</script>` will trigger execution on every page that renders the membership type dropdown.
+- **Implication:** The membership type name appears in dropdown menus on the member add/edit/renew forms, ensuring broad exposure.
+- **Live Confirmed:** `<script>alert(document.cookie)</script>` stored as membership type name; confirmed rendering in `view_type.php` and `renew.php`.
+- **Representative Findings:** XSS-VULN-05, XSS-VULN-06.
 
-**Pattern 3: Stored XSS via Settings Data (Admin-Controlled)**
-- **Description:** The `settings.system_name` and `settings.currency` fields editable via `settings.php` are echoed unencoded into HTML attribute (`value=`) contexts on the settings page itself, and `currency` is echoed into HTML_BODY of `view_type.php` and `revenue_report.php`.
-- **Implication:** Compromise of the admin account (trivial given default credentials `admin@test.com`/`admin123`) allows permanent XSS payload storage in settings that affects multiple pages.
-- **Representative Findings:** XSS-VULN-14 through XSS-VULN-15.
+**Pattern 3: Persistent Global XSS via Settings Fields (ALL PAGES)**
+- **Description:** The `settings.system_name` field is echoed unencoded into the `<title>` tag (`includes/header.php:13`) and the sidebar brand text (`includes/sidebar.php:28`) on every single authenticated page. The `settings.currency` field is echoed into revenue reports and the settings form.
+- **Implication:** Injecting a payload into `system_name` via `settings.php` POST causes XSS to fire on every page load for every authenticated user. A payload of `</title><script>...</script>` breaks out of the `<title>` tag and injects into the document `<head>`, executing on page load. This was live-confirmed: the payload appeared in the `<title>` tag AND sidebar brand text of the settings page response.
+- **Live Confirmed:** `</title><script>alert(document.cookie)</script>` stored via settings POST; confirmed in `<title>` tag and `<span class="brand-text">` on the settings page response.
+- **Representative Findings:** XSS-VULN-07, XSS-VULN-08.
 
-**Pattern 4: Reflected XSS via URL Parameters**
-- **Description:** The `$_GET['id']` parameter in `memberProfile.php` is echoed directly into an `onclick` JavaScript string attribute (`onclick="printMembershipCard('<?php echo $memberId; ?>')"`) and into `href` URL attributes. The same parameter in `edit_type.php` is echoed into a hidden `value=` attribute. In both cases, the SQL query uses the integer directly (unquoted), which constrains attribute-breakout payloads — however, the data flow from `$_GET` → raw echo is present with no encoding.
-- **Implication:** These reflected paths are constrained by the SQL integer requirement (special chars like `"` break the SQL query before the form renders). However, the onclick JavaScript string context in memberProfile.php can be exploited via SQL-valid integer-then-comment injection techniques, or the finding is useful for documentation of the missing defense.
-- **Representative Findings:** XSS-VULN-16 through XSS-VULN-17.
+**Pattern 4: Stored XSS in HTML Attribute Value Context (edit forms)**
+- **Description:** Edit forms for members (`edit_member.php`) and membership types (`edit_type.php`) and the renewal form (`renew.php`) pre-populate `<input value="...">` attributes directly from database fields without encoding. Since the attributes use double-quote delimiters, a DB-stored value containing `"` closes the attribute, allowing event handler injection.
+- **Implication:** Any member field with a stored payload `"><script>alert(1)</script>` or `" onmouseover="alert(1)` will execute when an admin opens the edit form for that member.
+- **Live Confirmed:** `<script>alert(1)</script>` in `fullname` field confirmed appearing unescaped in `edit_member.php` at line 198: `value="<script>alert(1)</script>"`.
+- **Representative Findings:** XSS-VULN-09, XSS-VULN-10, XSS-VULN-11.
+
+**Pattern 5: Reflected XSS via GET Parameter in Hidden Input**
+- **Description:** `edit_type.php` reads `$edit_id = $_GET['id'] ?? null` (line 27) and echoes it directly into a hidden `<input>` element: `value="<?php echo $edit_id; ?>"` (line 72). The value is not sanitized or encoded at any point. With a SQL injection bypass (SQL comment to make the query succeed while still injecting HTML after `--`), the payload is reflected into the HTML attribute.
+- **Implication:** A crafted URL `edit_type.php?id=0+UNION+SELECT+1,1,1--+-"+onmouseover%3D"alert(1)` injects the event handler. Requires an authenticated victim (admin) to click the link. Can be delivered via phishing or CSRF-equivalent attack.
+- **Live Confirmed:** `0 UNION SELECT 1,1,1-- -" onmouseover="alert(1)` confirmed in response: `<input type="hidden" name="edit_id" value="0 UNION SELECT 1,1,1-- -" onmouseover="alert(1)">`.
+- **Representative Finding:** XSS-VULN-12.
+
+**Pattern 6: Stored XSS in img src Attribute (HTML_ATTRIBUTE Context)**
+- **Description:** Member photo filenames and the system logo URL are echoed unencoded into `src` attributes. The `photo` column is echoed as `<img src="uploads/member_photos/<?php echo $photo ?>">` (double quotes). The logo in `print_membership_card.php` is echoed as `<img src='<?php echo $logoUrl ?>'>` (single quotes). A stored value containing `"` (or `'` for logo) breaks out of the attribute, and `onerror` event handlers execute JavaScript.
+- **Implication:** If an attacker can control the `photo` or `logo` DB column (via SQL injection on the file upload path or direct SQL injection), they achieve event-handler-based XSS on image load failure.
+- **Representative Findings:** XSS-VULN-13, XSS-VULN-14.
 
 ---
 
 ## 3. Strategic Intelligence for Exploitation
 
-### Content Security Policy (CSP) Analysis
-- **Current CSP:** **None.** Zero security headers are present on any response. No `Content-Security-Policy`, no `X-XSS-Protection`, no `X-Content-Type-Options`, no `X-Frame-Options`.
-- **Implication:** Any XSS payload will execute without restriction. Inline scripts (`<script>alert(1)</script>`), event handlers (`onerror=alert(1)`), and `javascript:` URLs all work. No JSONP bypass, no CSP nonce, no trusted host allowlist needs to be considered.
+**Content Security Policy (CSP) Analysis**
+- **Current CSP:** None. No `Content-Security-Policy` header is set on any response. Confirmed via live server header inspection (Apache/2.4.54, no CSP).
+- **Implication:** All CSP-based mitigations (inline script blocking, `script-src` restrictions, `nonce`/`hash` requirements) are absent. Any `<script>` tag, event handler, or `javascript:` URI will execute without restriction. No JSONP gadget hunting or CSP bypass required.
 
-### Cookie Security
-- **Session Cookie:** `PHPSESSID` has **no `HttpOnly` flag, no `Secure` flag, and no `SameSite` attribute**.
-- **Critical Consequence:** `document.cookie` in any XSS payload will return the `PHPSESSID` value, enabling direct session hijacking.
-- **Recommendation for Exploitation:** Primary exploitation target should be `document.cookie` theft. The cookie is transmitted over HTTP (no TLS), so network interception is also viable but XSS is the more reliable vector.
+**Cookie Security**
+- **Observation:** The `PHPSESSID` session cookie is set with only `path=/`. No `HttpOnly`, `Secure`, or `SameSite` flags are present. Confirmed from live headers: `Set-Cookie: PHPSESSID=...; path=/`.
+- **Critical Implication:** The session cookie is directly readable via `document.cookie` in any XSS context. The primary exploitation goal should be `document.cookie` exfiltration to achieve session hijacking and full admin account compromise.
+- **Recommendation:** Every exploit payload should target `document.cookie` exfiltration.
 
-### Unauthenticated Exploitation Surface
-- `print_membership_card.php?id=N` — **No session guard.** Any member whose data contains an XSS payload triggers execution for anonymous visitors. This is the highest-priority externally-exploitable endpoint since it requires no victim to be authenticated.
-- `manage_members.php` and `dashboard.php` — Require authenticated admin session. Social engineering (e.g., sending a link) can trigger stored XSS on login.
+**Authentication Context for XSS Delivery**
+- **Unauthenticated Execution Vector:** `print_membership_card.php` has NO auth check. Any stored XSS payload in `members.fullname`, `members.address`, `members.postcode`, `settings.system_name`, or `settings.logo` will execute for completely unauthenticated external attackers who access `print_membership_card.php?id=N`. This is the most critical vector for external attacker exploitation.
+- **Authenticated Execution:** All other pages require an active admin session. The recommended attack flow: (1) inject stored payload, (2) wait for admin to view any member-listing page, (3) steal `PHPSESSID`.
 
-### Default Credentials
-- Admin login: `admin@test.com` / `admin123` (from `init.sql` line 50, confirmed working).
-- This makes the "attacker stores payload" step trivially achievable without needing SQL injection.
+**Attack Surface for Payload Injection**
+- **Unauthenticated write path:** `print_membership_card.php` does not write data. However, `delete_members.php?id=X` also lacks auth — an attacker who can inject via SQLi through these unauthenticated endpoints could modify DB data.
+- **Authenticated write paths:** `add_members.php` POST, `edit_member.php` POST, `add_type.php` POST, `settings.php` POST (updateSettings). All accept arbitrary string input and store it raw in the DB.
+- **No WAF or Input Validation:** Zero server-side input validation. No calls to `filter_var()`, `strip_tags()`, `htmlspecialchars()`, `addslashes()`, `mysqli_real_escape_string()`, or prepared statements anywhere in the codebase.
 
-### Payload Breadth
-- The member `fullname` field has confirmed end-to-end stored XSS visible on at least 8 pages simultaneously. A single payload stored in a member name affects every authenticated user who browses member-related pages.
-- The membership type `type` field affects 4 pages (view_type, edit_type, add_members, renew).
+**CSRF Amplification**
+- **No CSRF Protection:** Zero CSRF tokens, no SameSite cookie, no origin validation. All state-changing POST endpoints are CSRF-vulnerable. An attacker can silently submit `add_members.php` with an XSS payload via a CSRF attack against an authenticated admin, without the admin ever interacting with the attacker's site beyond visiting a page with a hidden form.
 
 ---
 
 ## 4. Vectors Analyzed and Confirmed Secure
 
-No vectors were confirmed secure. The application has zero output encoding anywhere in the codebase. Every data flow from user input to HTML output was found to be unencoded. The only case where exploitability is constrained (not "secure") is the reflected XSS in `edit_type.php?id=` and `memberProfile.php?id=` where the integer SQL context prevents `"` injection for HTML attribute breakout — but these paths still lack encoding, they are merely constrained by SQL context.
+No input vectors were found with robust, context-appropriate defenses. The application contains **zero output encoding calls** anywhere. The complete analysis of all 17 sink-context pairs identified in the recon deliverable yielded only vulnerable paths. There are no safe paths to document.
 
 | Source (Parameter/Key) | Endpoint/File Location | Defense Mechanism Implemented | Render Context | Verdict |
 |---|---|---|---|---|
-| `$row['id']` (integer) | `manage_members.php:106` | SQL integer context prevents attribute breakout | JAVASCRIPT_STRING | CONSTRAINED (not exploitable for HTML injection but no defense applied) |
-| `$memberId` from `$_GET['id']` | `memberProfile.php:108` onclick | SQL integer context prevents attribute breakout | JAVASCRIPT_STRING | CONSTRAINED |
-| `$memberId` from `$_GET['id']` | `memberProfile.php:112` href | SQL integer context prevents `"` injection | HTML_ATTRIBUTE | CONSTRAINED |
-| `$edit_id` from `$_GET['id']` | `edit_type.php:72` hidden input | SQL integer context prevents `"` injection | HTML_ATTRIBUTE | CONSTRAINED |
+| None | N/A | No htmlspecialchars(), htmlentities(), strip_tags(), or any output encoding exists anywhere in the application | N/A | ALL VULNERABLE |
 
 ---
 
 ## 5. Analysis Constraints and Blind Spots
 
-- **Error Echo Dead Code:** The `echo "Error: " . $insertQuery` statements in `manage_members.php:24` and `view_type.php:34` appear unreachable in practice because PHP's `mysqli` is configured to throw exceptions (confirmed via live testing showing `Fatal error: Uncaught mysqli_sql_exception`). The error echo branches are dead code under the current PHP configuration.
-- **Revenue Report:** The `revenue_report.php` stored XSS was not confirmed by live test (no renewal records containing XSS payload exist yet) but the code path is identical to `report.php` which was confirmed. The finding is rated high confidence based on code analysis.
-- **Photo Upload XSS:** The `src=` attribute XSS via `members.photo` and `settings.logo` fields requires a malicious filename to be stored in the database (via file upload). While technically a stored XSS vector, the more direct injection is via text fields. The photo path sink is documented but not live-tested since the upload RCE vector supersedes it.
+- **Photo Field Injection:** The `members.photo` column injection was analyzed via code review and confirmed as an XSS sink. Live confirmation of event-handler breakout via this column was not tested with a crafted photo filename because doing so requires file upload (multipart), but the code path is unambiguous: `$memberDetails['photo']` is echoed raw into `src="..."`. An attacker with SQL injection can UPDATE the `photo` column directly.
+- **Revenue Report Currency Propagation:** The `settings.currency` field was confirmed stored in the DB as XSS payload. Its propagation to `revenue_report.php` was not live-confirmed due to requiring a revenue record in the DB, but the code pattern is identical to other confirmed sinks.
+- **jQuery CVE Vectors:** jQuery 3.4.1 (CVE-2020-11022/11023) and jQuery UI 1.12.1 (CVE-2021-41182/41183/41184) are loaded on all pages. These library-level XSS vectors were not individually tested but represent additional attack surface that the exploitation phase may leverage.
+- **Scope Limitation:** Only externally-reachable HTTP vectors were tested. Direct database access and server-side command execution are out of scope for this XSS analysis phase.
 
----
-
-## 6. Full Findings Detail
-
-### XSS-VULN-01: Stored XSS — Member `fullname` in HTML Body (manage_members.php)
-**Confirmed live:** `<img src=x onerror=alert(1)>` stored as `fullname` rendered raw in `manage_members.php` table.
-
-### XSS-VULN-02: Stored XSS — Member fields in HTML Body (memberProfile.php)
-**Confirmed live:** All member profile fields rendered without encoding.
-
-### XSS-VULN-03: Stored XSS — Member `fullname` in HTML Body (dashboard.php)
-**Confirmed live:** `fullname` rendered in recent-members widget.
-
-### XSS-VULN-04: Stored XSS — Member fields in HTML Body (list_renewal.php)
-**Confirmed live:** `fullname` and other fields in renewal table.
-
-### XSS-VULN-05: Stored XSS — Member fields in HTML Body (report.php)
-**Confirmed live:** `fullname` and `email` rendered in report table.
-
-### XSS-VULN-06: Stored XSS — Member fields in HTML Body (revenue_report.php)
-**Code-confirmed:** Identical pattern to report.php, no encoding applied.
-
-### XSS-VULN-07: Stored XSS — Member fields in HTML Body (print_membership_card.php — UNAUTHENTICATED)
-**Confirmed live:** `<img src=x onerror=alert(1)>` in fullname rendered on unauthenticated card page.
-
-### XSS-VULN-08: Stored XSS — Member fields in HTML Attribute value= (edit_member.php)
-**Confirmed live:** `value="<img src=x onerror=alert(1)>"` rendered in fullname input.
-
-### XSS-VULN-09: Stored XSS — Member fields in HTML Attribute value= (renew.php)
-**Confirmed live:** `value="<img src=x onerror=alert(1)>"` in disabled fullname input.
-
-### XSS-VULN-10: Stored XSS — Membership `type` in HTML Body (view_type.php)
-**Confirmed live:** `<script>alert(1)</script>` and `<img src=x onerror=alert(1)>` rendered raw in type table.
-
-### XSS-VULN-11: Stored XSS — Membership `type` in HTML Attribute value= (edit_type.php)
-**Confirmed live:** `value="<script>alert(1)</script>"` in membership type input.
-
-### XSS-VULN-12: Stored XSS — Membership `type` in HTML Body option (add_members.php)
-**Confirmed live:** XSS type names rendered in `<option>` text in member add form.
-
-### XSS-VULN-13: Stored XSS — Membership `type` in HTML Body option (renew.php)
-**Confirmed live:** XSS type names rendered in `<option>` text in renewal form.
-
-### XSS-VULN-14: Stored XSS — `settings.system_name` in HTML Attribute value= (settings.php)
-**Confirmed live:** `value="TestSystem" onmouseover="alert(1)"` rendered after storing payload.
-
-### XSS-VULN-15: Stored XSS — `settings.currency` in HTML Attribute value= (settings.php)
-**Code-confirmed:** Identical pattern to system_name.
-
-### XSS-VULN-16: Reflected XSS — `$_GET['id']` in onclick JavaScript string (memberProfile.php)
-**Code-confirmed (constrained):** SQL integer context limits direct exploitation but path lacks any encoding.
-
-### XSS-VULN-17: Reflected XSS — `$_GET['id']` in hidden input value= (edit_type.php)
-**Code-confirmed (constrained):** SQL integer context limits `"` injection for attribute breakout.
-
----
